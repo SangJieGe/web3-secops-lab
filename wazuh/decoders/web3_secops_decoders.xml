@@ -1,0 +1,37 @@
+# Wazuh decoders for Web3 SecOps Lab
+#
+# Install to: /var/ossec/etc/decoders/web3_secops_decoders.xml
+# Then restart the manager: systemctl restart wazuh-manager
+
+<!-- Base decoder: matches our JSON-lines alert format -->
+<decoder name="web3-secops">
+  <prematch>^{"rule":</prematch>
+</decoder>
+
+<!-- Extract the dstuser-like fields we care about for rule matching -->
+<decoder name="web3-secops-fields">
+  <parent>web3-secops</parent>
+  <regex offset="after_parent">"rule":\s*"(\S+?)",\s*"severity":\s*"(\S+?)",\s*"title":\s*"(.*?)"</regex>
+  <order>rule.id, rule.severity, rule.title</order>
+</decoder>
+
+<!-- Extract the involved address (watchlist hit) -->
+<decoder name="web3-secops-address">
+  <parent>web3-secops</parent>
+  <regex offset="after_parent">"address":\s*"(0x\w+)"</regex>
+  <order>web3.address</order>
+</decoder>
+
+<!-- Extract transaction hash -->
+<decoder name="web3-secops-tx">
+  <parent>web3-secops</parent>
+  <regex offset="after_parent">"tx_hash":\s*"(0x\w+)"</regex>
+  <order>web3.tx_hash</order>
+</decoder>
+
+<!-- Extract block number -->
+<decoder name="web3-secops-block">
+  <parent>web3-secops</parent>
+  <regex offset="after_parent">"block_number":\s*(\d+)</regex>
+  <order>web3.block_number</order>
+</decoder>
