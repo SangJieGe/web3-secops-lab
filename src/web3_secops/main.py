@@ -1,225 +1,98 @@
-"""Entry point: wire config -> scanner -> decoder -> detector -> alert sink.
+"""Web3 SecOps Lab — Week 1 程序入口。
 
-Read-only by design: this loop never signs or broadcasts anything.
+第一周的目标很小，只有三件事：
+
+1. 程序能启动。
+2. 能读取配置文件（环境变量 / .env）。
+3. 能输出结构化日志（每行一个 JSON）。
+
+链上数据读取（Ethereum JSON-RPC）属于 Week 2，暂不集成到主程序。
+
+运行方式：
+
+    python -m web3_secops.main
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import signal
 import sys
-import time
-from pathlib import Path
+from datetime import UTC, datetime
 from typing import Any
 
-import structlog
-import yaml
 from dotenv import load_dotenv
 
-from .block_scanner import BlockScanner, CursorStore
-from .detector import Detector, DetectorConfig, Finding, WatchEntry, filter_by_severity
-from .event_decoder import EventDecoder, RawLog
-from .rpc_client import RpcClient
-
-load_dotenv()
-log = structlog.get_logger("web3_secops")
-
-_RUNNING = True
-
-
-def _handle_signal(signum: int, _frame: Any) -> None:
-    global _RUNNING
-    log.info("shutdown_requested", signal=signum)
-    _RUNNING = False
-
 
 # ---------------------------------------------------------------------------
-# Config loading
+# 1. 结构化日志
 # ---------------------------------------------------------------------------
-def load_watchlist(path: str | Path) -> dict[str, Any]:
-    return yaml.safe_load(Path(path).read_text()) or {}
+def log(level: str, event: str, **fields: Any) -> None:
+    """输出一行 JSON 结构化日志到 stdout。
 
-
-def build_detector_config(watchlist: dict[str, Any], chain_id: int | None) -> DetectorConfig:
-    watched: dict[str, WatchEntry] = {}
-    for entry in watchlist.get("addresses", []) or []:
-        addr = entry["address"].lower()
-        watched[addr] = WatchEntry(
-            address=addr,
-            label=entry.get("label", addr),
-            severity=entry.get("severity", "high"),
-            tags=entry.get("tags", []) or [],
-            watch_inbound=entry.get("watch_inbound", True),
-            watch_outbound=entry.get("watch_outbound", True),
-        )
-
-    flagged = {
-        c["address"].lower(): {
-            "label": c.get("label", c["address"]),
-            "reason": c.get("reason", ""),
-            "severity": c.get("severity", "high"),
-        }
-        for c in (watchlist.get("flagged_contracts", []) or [])
+    每行是一个独立的 JSON 对象（JSON Lines 格式）。
+    这样做的好处是：日志既能给人看，也能被程序解析，
+    以后要接 Wazuh / Filebeat 之类的采集器时会很方便。
+    """
+    record = {
+        "ts": datetime.now(UTC).isoformat(),
+        "level": level,
+        "event": event,
+        **fields,
     }
-
-    thresholds = watchlist.get("thresholds", {}) or {}
-    return DetectorConfig(
-        watched=watched,
-        flagged_contracts=flagged,
-        min_notable_value=float(
-            thresholds.get("min_notable_value", os.getenv("MIN_NOTABLE_VALUE", 10))
-        ),
-        rapid_drain_count=int(thresholds.get("rapid_drain_count", 3)),
-        rapid_drain_window_seconds=int(thresholds.get("rapid_drain_window_seconds", 300)),
-        chain_id=chain_id,
-    )
-
-
-def build_event_decoder(watchlist: dict[str, Any]) -> EventDecoder:
-    decoder = EventDecoder()
-    for contract in watchlist.get("contracts", []) or []:
-        abi = contract.get("abi")
-        if abi and Path(abi).exists():
-            n = decoder.register_from_abi_file(abi)
-            log.info("abi_loaded", contract=contract.get("label"), events=n)
-    return decoder
+    print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Alert sink
+# 2. 读取配置
 # ---------------------------------------------------------------------------
-class AlertSink:
-    """Append findings as JSON lines; Wazuh agent tails this file."""
+# 第一周只有这几个配置项，都是当前程序真正会用到的。
+DEFAULTS: dict[str, str] = {
+    "APP_NAME": "web3-secops-lab",
+    "LOG_LEVEL": "INFO",
+}
 
-    def __init__(self, path: str | Path, min_severity: str = "low"):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.min_severity = min_severity
 
-    def emit(self, findings: list[Finding]) -> int:
-        kept = filter_by_severity(findings, self.min_severity)
-        if not kept:
-            return 0
-        with self.path.open("a", encoding="utf-8") as fh:
-            for f in kept:
-                fh.write(json.dumps(f.to_dict()) + "\n")
-                log.info("alert", rule=f.rule, severity=f.severity, title=f.title)
-        return len(kept)
+def load_config() -> dict[str, Any]:
+    """从环境变量（含 .env 文件）读取配置，缺失时回退到 DEFAULTS。
+
+    优先级：真实环境变量 > .env 文件 > 代码内 DEFAULTS。
+
+    load_dotenv() 默认不会覆盖已经存在的环境变量，
+    所以这个优先级顺序是天然成立的。
+    """
+    load_dotenv()  # 把 .env 里的键值读进 os.environ
+
+    config: dict[str, Any] = {}
+    for key, default in DEFAULTS.items():
+        config[key] = os.getenv(key, default)
+
+    return config
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# 3. 主流程
 # ---------------------------------------------------------------------------
-def run(args: argparse.Namespace) -> int:
-    watchlist = load_watchlist(args.watchlist)
-    chain_name = args.chain
-    chains = {c["name"]: c for c in watchlist.get("chains", []) or []}
-    if chain_name not in chains:
-        log.error("unknown_chain", chain=chain_name, available=list(chains))
-        return 2
+def main() -> int:
+    """程序主入口：启动 → 读配置 → 打日志 → 退出。"""
+    log("INFO", "startup", app="web3-secops-lab")
 
-    chain = chains[chain_name]
-    chain_id = int(chain["chain_id"])
-    rpc_url = os.getenv(chain.get("rpc_env", ""), "")
-    if not rpc_url:
-        log.error("rpc_url_missing", env=chain.get("rpc_env"))
-        return 2
+    try:
+        config = load_config()
+    except Exception as exc:  # noqa: BLE001 — 配置读不出来就直接报错退出
+        log("ERROR", "config_load_failed", error=str(exc))
+        return 1
 
-    client = RpcClient(rpc_url, chain_id=chain_id)
-    store = CursorStore(
-        os.getenv("STATE_DB_PATH", "./data/state.db"),
-        chain_id=chain_id,
-    )
-    scanner = BlockScanner(
-        client,
-        store,
-        chain_id=chain_id,
-        lookback=int(os.getenv("START_BLOCK_LOOKBACK", 100)),
-        batch_size=int(os.getenv("BLOCK_BATCH_SIZE", 5)),
-    )
-    detector = Detector(build_detector_config(watchlist, chain_id))
-    decoder = build_event_decoder(watchlist)
-    alerts_cfg = watchlist.get("alerts", {}) or {}
-    sink = AlertSink(
-        alerts_cfg.get("file_path", os.getenv("ALERT_LOG_PATH", "./logs/alerts.jsonl")),
-        min_severity=alerts_cfg.get("min_severity", "low"),
+    log(
+        "INFO",
+        "config_loaded",
+        app_name=config["APP_NAME"],
+        log_level=config["LOG_LEVEL"],
     )
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    poll = int(os.getenv("POLL_INTERVAL_SECONDS", 12))
-    log.info("starting", chain=chain_name, chain_id=chain_id,
-             head=scanner.head(), watchlist=args.watchlist)
-
-    global _RUNNING
-    while _RUNNING:
-        emitted = 0
-        for block in scanner.stream(max_blocks=args.max_blocks):
-            findings = detector.inspect_block(block)
-
-            # Decode events for contracts in the watchlist, then rule on them
-            contract_addrs = [
-                c["address"].lower() for c in (watchlist.get("contracts", []) or [])
-            ]
-            if contract_addrs and block.transactions:
-                logs = client.get_logs(block.number, block.number, address=contract_addrs)
-                for entry in logs:
-                    decoded = decoder.decode(RawLog.from_rpc(entry))
-                    if decoded:
-                        findings += detector.inspect_event(decoded)
-
-            emitted += sink.emit(findings)
-            log.info("block_scanned", number=block.number,
-                     txs=len(block.transactions), alerts=len(findings))
-
-        if args.once:
-            break
-        log.debug("sleeping", seconds=poll)
-        for _ in range(poll):
-            if not _RUNNING:
-                break
-            time.sleep(1)
-
-    client.close()
-    store.close()
-    log.info("stopped")
+    log("INFO", "shutdown", status="ok")
     return 0
 
 
-def cli(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="web3-secops",
-        description="Web3 SecOps Lab — read-only on-chain security monitor",
-    )
-    parser.add_argument(
-        "--watchlist", default="config/watchlist.yaml",
-        help="Path to watchlist YAML (default: config/watchlist.yaml)",
-    )
-    parser.add_argument(
-        "--chain", default="ethereum",
-        help="Chain name from the watchlist (default: ethereum)",
-    )
-    parser.add_argument(
-        "--once", action="store_true",
-        help="Scan once and exit (useful for tests / cron)",
-    )
-    parser.add_argument(
-        "--max-blocks", type=int, default=None,
-        help="Stop after scanning N blocks (default: run continuously)",
-    )
-    parser.add_argument("--verbose", action="store_true", help="DEBUG logging")
-    args = parser.parse_args(argv)
-
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            10 if args.verbose else 20
-        )
-    )
-    return run(args)
-
-
 if __name__ == "__main__":
-    sys.exit(cli())
+    sys.exit(main())

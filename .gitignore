@@ -10,13 +10,13 @@ dist/
 *.egg
 .eggs/
 
-# Virtual envs
+# ---- 虚拟环境 ----
 .venv/
 venv/
 env/
 ENV/
 
-# Test / coverage
+# ---- 测试 / 覆盖率 ----
 .pytest_cache/
 .coverage
 .coverage.*
@@ -25,12 +25,12 @@ htmlcov/
 .nox/
 coverage.xml
 
-# Type checkers / linters
+# ---- 类型检查 / linter ----
 .mypy_cache/
 .ruff_cache/
 .dmypy.json
 
-# ---- Secrets & env ----
+# ---- 密钥与本地配置 ----
 .env
 .env.*
 !.env.example
@@ -38,22 +38,15 @@ coverage.xml
 *.key
 secrets/
 credentials.json
-watchlist.yaml
-config/watchlist.yaml
 
-# ---- Node (if any tooling added) ----
-node_modules/
-npm-debug.log*
+# ---- 日志与运行时文件 ----
+logs/
+*.log
+data/
 
-# ---- IDE / OS ----
+# ---- IDE / 系统 ----
 .idea/
 .vscode/
 *.swp
 .DS_Store
 Thumbs.db
-
-# ---- Runtime artifacts ----
-logs/
-*.log
-data/
-.cache/

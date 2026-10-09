@@ -1,152 +1,126 @@
 # Web3 SecOps Lab
 
-> A hands-on lab for **Web3 security operations**: on-chain event monitoring, threat detection, and Wazuh-based alerting.
+一个用于学习 **Web3 安全运维（SecOps）** 的实验项目。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+**长期目标**：学习并实践 Web3 安全运维、链上监控与安全事件响应。
 
-## What is this?
+**当前进度**：Week 1 ✅
 
-`web3-secops-lab` is a small, readable toolkit that watches EVM chains for security-relevant
-activity and surfaces it into a traditional SOC pipeline (Wazuh). It is designed as a
-**learning + reference lab**: every module is small enough to read end-to-end, yet the
-pipeline is realistic enough to detect real things.
+---
 
-Typical use cases:
+## 当前状态（Week 1）
 
-- Watch a list of sensitive addresses (treasury, multisig, admin EOAs) and alert on any movement.
-- Scan blocks for large native-token transfers.
-- Decode contract events and flag interactions with known-bad or high-privilege contracts.
-- Feed structured alerts into Wazuh for correlation, dashboards, and incident response.
+目前已经**真实实现并验证**的功能只有三件：
 
-## Architecture
+1. **程序启动** —— 可以通过 `python -m web3_secops.main` 启动。
+2. **读取配置** —— 从环境变量或 `.env` 文件读取配置，缺失时回退到默认值。
+3. **输出结构化日志** —— 每行输出一个 JSON 对象（JSON Lines 格式）。
 
-```
-                    +-------------------+
-                    |   EVM JSON-RPC    |
-                    | (Eth/Base/Arb...) |
-                    +---------+---------+
-                              |
-                     rpc_client.py  (retry, rate-limit, batching)
-                              |
-                     block_scanner.py  (cursor, backfill, dedup)
-                              |
-                     event_decoder.py  (ABI decode, topic match)
-                              |
-                        detector.py    (rules -> findings)
-                              |
-                        main.py        (loop + alert sink)
-                              |
-                 logs/alerts.jsonl  --(wazuh agent)-->  Wazuh manager
-                                                          |
-                                                    decoders + rules
-                                                          |
-                                                     dashboards / IR
-```
+> ⚠️ 本项目**没有**实现任何链上监控、智能合约审计、Wazuh 告警或生产级安全能力。
+> 下文「后续规划」中的内容**尚未实现**。
 
-See [`docs/architecture.md`](docs/architecture.md) for a detailed walkthrough.
+---
 
-## Project layout
+## 目录结构
 
 ```
 web3-secops-lab/
-├── src/web3_secops/
-│   ├── rpc_client.py      # JSON-RPC transport: retries, batching, rate limit
-│   ├── block_scanner.py   # Block iteration + persistent cursor + dedup
-│   ├── event_decoder.py   # Log/event ABI decoding
-│   ├── detector.py        # Detection rules over decoded activity
-│   └── main.py            # Entry point / orchestration loop
-├── config/
-│   └── watchlist.example.yaml
+├── src/
+│   └── web3_secops/
+│       ├── __init__.py
+│       └── main.py            # Week 1 主程序：启动 + 读配置 + 结构化日志
 ├── tests/
-│   ├── fixtures/
-│   ├── test_rpc_client.py
-│   ├── test_event_decoder.py
-│   └── test_detector.py
-├── deploy/
-│   └── docker-compose.yml
-├── wazuh/
-│   ├── decoders/
-│   └── rules/
-├── contracts/             # Sample contracts / ABIs used in tests & demos
-├── docs/
-│   ├── architecture.md
-│   ├── threat-model.md
-│   ├── incident-response.md
-│   └── security-assessment.md
-├── .env.example
+│   ├── __init__.py
+│   └── test_main.py           # Week 1 测试
+├── .env.example               # 环境配置示例
 ├── .gitignore
-├── README.md
-└── pyproject.toml
+├── LICENSE
+├── pyproject.toml             # 项目元数据、依赖、测试与 lint 配置
+└── README.md
 ```
 
-## Quick start
+---
+
+## 安装依赖
+
+需要 Python **3.11** 或更高版本。
 
 ```bash
-# 1. Clone
-git clone https://github.com/<you>/web3-secops-lab.git
-cd web3-secops-lab
+# 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 
-# 2. Configure
+# 安装（含开发依赖）
+pip install -e ".[dev]"
+```
+
+---
+
+## 配置
+
+复制示例配置，按需修改：
+
+```bash
 cp .env.example .env
-cp config/watchlist.example.yaml config/watchlist.yaml
-# edit .env and watchlist.yaml with your RPC + addresses
+```
 
-# 3. Install (uv or pip)
-uv sync           # or: pip install -e ".[dev]"
+Week 1 只有两个配置项：
 
-# 4. Run tests
-pytest -q
+- `APP_NAME` —— 应用名称（默认 `web3-secops-lab`）
+- `LOG_LEVEL` —— 日志级别（默认 `INFO`）
 
-# 5. Run the scanner
+配置优先级：**真实环境变量 > `.env` 文件 > 代码内默认值**。
+
+真实的 `.env` 文件已被 `.gitignore` 忽略，不会提交到 Git。
+
+---
+
+## 运行
+
+```bash
 python -m web3_secops.main
 ```
 
-### Run with Docker
+预期输出（每行一个 JSON）：
 
-```bash
-cd deploy
-docker compose up --build
+```json
+{"ts": "...", "level": "INFO", "event": "startup", "app": "web3-secops-lab"}
+{"ts": "...", "level": "INFO", "event": "config_loaded", "app_name": "web3-secops-lab", "log_level": "INFO"}
+{"ts": "...", "level": "INFO", "event": "shutdown", "status": "ok"}
 ```
 
-## Configuration
+---
 
-Everything is driven by `.env` (secrets/endpoints) and `config/watchlist.yaml`
-(what to watch). See `.env.example` for all knobs and
-[`config/watchlist.example.yaml`](config/watchlist.example.yaml) for the schema.
+## 测试
 
-## Security posture
+```bash
+pytest
+```
 
-This project is **read-only by design**:
+测试覆盖 Week 1 的真实功能：配置读取（含默认值回退）、结构化日志输出、主流程执行。
 
-- It never holds private keys and never signs or broadcasts transactions.
-- All RPC calls are read-only (`eth_getLogs`, `eth_getBlockByNumber`, `eth_call`, ...).
-- Alerts are pushed to a local file / Wazuh agent — no external write actions.
+代码检查：
 
-See [`docs/threat-model.md`](docs/threat-model.md) and
-[`docs/security-assessment.md`](docs/security-assessment.md) for the full analysis.
+```bash
+ruff check .
+```
 
-## Documentation
+---
 
-| Doc | Contents |
-|-----|----------|
-| [architecture.md](docs/architecture.md) | Component design & data flow |
-| [threat-model.md](docs/threat-model.md) | Assets, adversaries, STRIDE-style analysis |
-| [incident-response.md](docs/incident-response.md) | Runbooks for common on-chain incidents |
-| [security-assessment.md](docs/security-assessment.md) | Self-assessment, gaps, hardening roadmap |
+## 后续规划
 
-## Roadmap
+以下内容**尚未实现**，将在后续学习阶段逐步加入。列出仅为记录学习路线，不代表当前具备这些能力。
 
-- [ ] Multi-chain concurrent scanning
-- [ ] Wazuh decoder/rule pack (in progress)
-- [ ] Anomaly scoring (baseline + deviation)
-- [ ] Alert enrichment (token metadata, ENS, labels)
-- [ ] Sigma-style portable detection rules
+- ⏳ **Week 2：Ethereum JSON-RPC** —— 学习连接节点、调用只读 RPC 方法读取链上数据（例如查询最新区块号）。
+- ⏳ **Week 3+：区块扫描** —— 遍历区块、读取交易。
+- ⏳ **Week 4+：ERC-20 事件解码** —— 解析 `Transfer` / `Approval` 等事件日志。
+- ⏳ **后续：链上安全检测** —— 识别异常交易模式。
+- ⏳ **后续：Wazuh 集成** —— 把结构化日志接入 Wazuh 做告警。
+- ⏳ **后续：部署** —— Docker / Docker Compose 部署。
+- ⏳ **后续：智能合约审计** —— 合约安全分析。
 
-## Contributing
+---
 
-Issues and PRs welcome. Please run `pytest` and `ruff` before submitting.
+## 许可证
 
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT，详见 [LICENSE](LICENSE)。

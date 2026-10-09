@@ -5,47 +5,35 @@ build-backend = "hatchling.build"
 [project]
 name = "web3-secops-lab"
 version = "0.1.0"
-description = "A hands-on lab for Web3 security operations: on-chain event monitoring, threat detection, and Wazuh-based alerting."
+description = "A hands-on Web3 security operations lab. Week 1: process startup, config loading, and structured logging."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Web3 SecOps Lab Contributors" }]
-keywords = ["web3", "security", "secops", "evm", "monitoring", "wazuh", "blockchain"]
+authors = [{ name = "SangJieGe" }]
+keywords = ["web3", "security", "secops", "learning"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Security",
-    "Topic :: System :: Monitoring",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
 ]
 
+# Week 1 程序真正需要的依赖：读取 .env 配置。
+# 其余依赖（httpx / pyyaml / pydantic / structlog 等）等对应功能实现时再加。
 dependencies = [
-    "httpx>=0.27",
-    "pydantic>=2.6",
-    "pydantic-settings>=2.2",
-    "pyyaml>=6.0",
     "python-dotenv>=1.0",
-    "structlog>=24.1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-cov>=5.0",
-    "pytest-asyncio>=0.23",
     "ruff>=0.4",
-    "mypy>=1.10",
-    "respx>=0.21",       # httpx mocking for rpc_client tests
 ]
 
-[project.scripts]
-web3-secops = "web3_secops.main:cli"
-
 [project.urls]
-Homepage = "https://github.com/your-org/web3-secops-lab"
-Repository = "https://github.com/your-org/web3-secops-lab"
+Homepage = "https://github.com/SangJieGe/web3-secops-lab"
+Repository = "https://github.com/SangJieGe/web3-secops-lab"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/web3_secops"]
@@ -53,7 +41,6 @@ packages = ["src/web3_secops"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
-asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
@@ -63,9 +50,3 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
 ignore = ["E501"]
-
-[tool.mypy]
-python_version = "3.11"
-warn_unused_ignores = true
-warn_redundant_casts = true
-ignore_missing_imports = true
