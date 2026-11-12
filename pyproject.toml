@@ -4,36 +4,44 @@ build-backend = "hatchling.build"
 
 [project]
 name = "web3-secops-lab"
-version = "0.1.0"
-description = "A hands-on Web3 security operations lab. Week 1: process startup, config loading, and structured logging."
+version = "0.2.0"
+description = "A read-only Web3 security operations lab: Ethereum JSON-RPC collection and a crash-safe, reorg-aware block scanner."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "SangJieGe" }]
-keywords = ["web3", "security", "secops", "learning"]
+keywords = ["web3", "security", "secops", "ethereum", "blockchain", "monitoring"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Security",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 
-# Week 1 程序真正需要的依赖：读取 .env 配置。
-# 其余依赖（httpx / pyyaml / pydantic / structlog 等）等对应功能实现时再加。
+# httpx: the only runtime dependency beyond dotenv. Chosen over requests because
+# it gives granular connect/read timeouts and clean transport exception types.
 dependencies = [
+    "httpx>=0.27",
     "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "respx>=0.21",
     "ruff>=0.4",
 ]
+
+[project.scripts]
+web3-secops = "web3_secops.main:main"
 
 [project.urls]
 Homepage = "https://github.com/SangJieGe/web3-secops-lab"
 Repository = "https://github.com/SangJieGe/web3-secops-lab"
+Issues = "https://github.com/SangJieGe/web3-secops-lab/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/web3_secops"]
@@ -41,6 +49,7 @@ packages = ["src/web3_secops"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+filterwarnings = ["error::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100
@@ -48,5 +57,13 @@ target-version = "py311"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PT", "RUF"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests intentionally use long fixture literals and assert-heavy bodies.
+"tests/*" = ["PT011"]
+
+[tool.coverage.run]
+source = ["src/web3_secops"]
+omit = ["*/__init__.py"]

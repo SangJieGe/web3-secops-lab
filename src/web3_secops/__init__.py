@@ -1,6 +1,9 @@
-"""Web3 SecOps Lab — 学习 Web3 安全运维的实验项目。
+"""Web3 SecOps Lab — read-only on-chain data collection.
 
-Week 1：程序启动、配置读取、结构化日志。
+M1 scope: an allowlisted Ethereum JSON-RPC client and a crash-safe,
+reorg-aware block scanner. No signing, no broadcasting, no key material.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+__all__ = ["__version__"]

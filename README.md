@@ -1,126 +1,180 @@
 # Web3 SecOps Lab
 
-一个用于学习 **Web3 安全运维（SecOps）** 的实验项目。
+A read-only on-chain security operations lab: collect Ethereum data safely, store
+it durably, and build toward SIEM-based detection.
 
-**长期目标**：学习并实践 Web3 安全运维、链上监控与安全事件响应。
-
-**当前进度**：Week 1 ✅
-
----
-
-## 当前状态（Week 1）
-
-目前已经**真实实现并验证**的功能只有三件：
-
-1. **程序启动** —— 可以通过 `python -m web3_secops.main` 启动。
-2. **读取配置** —— 从环境变量或 `.env` 文件读取配置，缺失时回退到默认值。
-3. **输出结构化日志** —— 每行输出一个 JSON 对象（JSON Lines 格式）。
-
-> ⚠️ 本项目**没有**实现任何链上监控、智能合约审计、Wazuh 告警或生产级安全能力。
-> 下文「后续规划」中的内容**尚未实现**。
+**Status: M1 complete.** M1 is the data-collection layer only. See
+[Scope and honesty](#scope-and-honesty) before assuming anything else works.
 
 ---
 
-## 目录结构
+## What this is
+
+A platform for **Web3 security monitoring and incident response**, built in
+stages so each stage is independently runnable and verifiable.
 
 ```
-web3-secops-lab/
-├── src/
-│   └── web3_secops/
-│       ├── __init__.py
-│       └── main.py            # Week 1 主程序：启动 + 读配置 + 结构化日志
-├── tests/
-│   ├── __init__.py
-│   └── test_main.py           # Week 1 测试
-├── .env.example               # 环境配置示例
-├── .gitignore
-├── LICENSE
-├── pyproject.toml             # 项目元数据、依赖、测试与 lint 配置
-└── README.md
+Ethereum / EVM  →  RPC Collector  →  Block Scanner  →  Event Decoder
+                                                      →  Detection Engine
+                                                      →  SIEM (Wazuh)
+                                                      →  Alerting & IR
+                └────────── M1 (done) ──────────┘  └──── M2+ (not built) ────┘
 ```
 
----
+| Stage | Component | Status |
+| --- | --- | --- |
+| M1-A | Read-only JSON-RPC client, allowlisted methods | **Implemented** |
+| M1-B | Reorg-aware block scanner with SQLite cursor | **Implemented** |
+| M1-C | CLI (`--check-rpc` / `--once` / `--watch`), config, JSON Lines logs | **Implemented** |
+| M2 | Event decoder (ERC-20 / ERC-721 transfers, approvals) | Not started |
+| M3 | Detection engine + Wazuh integration + alerting | Not started |
 
-## 安装依赖
+## Scope and honesty
 
-需要 Python **3.11** 或更高版本。
+M1 **collects** blocks. It does **not**:
+
+- detect attacks, exploits or suspicious activity
+- decode ERC-20 / ERC-721 events
+- ship data to Wazuh or emit any alert
+- sign, broadcast, or custody anything
+
+If a future README claims otherwise, that claim is wrong. Everything in this
+repository is a read-only collector plus its tests.
+
+## Quick start
 
 ```bash
-# 创建虚拟环境
-python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-
-# 安装（含开发依赖）
+git clone https://github.com/SangJieGe/web3-secops-lab.git
+cd web3-secops-lab
+python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-```
 
----
-
-## 配置
-
-复制示例配置，按需修改：
-
-```bash
 cp .env.example .env
+# edit .env: set ETHEREUM_RPC_URL and EXPECTED_CHAIN_ID
 ```
 
-Week 1 只有两个配置项：
-
-- `APP_NAME` —— 应用名称（默认 `web3-secops-lab`）
-- `LOG_LEVEL` —— 日志级别（默认 `INFO`）
-
-配置优先级：**真实环境变量 > `.env` 文件 > 代码内默认值**。
-
-真实的 `.env` 文件已被 `.gitignore` 忽略，不会提交到 Git。
-
----
-
-## 运行
+Three modes, all read-only:
 
 ```bash
-python -m web3_secops.main
+# 1. Verify connectivity, chain id, and current head. Writes nothing.
+python -m web3_secops --check-rpc
+
+# 2. Scan one batch of confirmed blocks, then exit.
+python -m web3_secops --once
+
+# 3. Scan continuously.
+python -m web3_secops --watch
 ```
 
-预期输出（每行一个 JSON）：
+`python -m web3_secops.main <mode>` is equivalent and remains supported; both
+forms are covered by tests that run a real subprocess, because a documented
+command that silently prints nothing is worse than no command.
+
+A bare invocation (no mode flag) prints usage and exits. It never starts an
+infinite loop implicitly.
+
+## Safety properties (M1)
+
+These are enforced in code and covered by tests, not just documented:
+
+- **Method allowlist, not a prefix check.** Only `eth_chainId`,
+  `eth_blockNumber`, `eth_getBlockByNumber` can leave the process. A naive
+  `method.startswith("eth_")` check would happily forward
+  `eth_sendRawTransaction`; this project rejects unknown methods *before* HTTP is
+  attempted, and the tests assert that no request was emitted.
+- **No key material in logs.** The RPC URL is redacted (`/v2/<KEY>`,
+  `?apikey=<KEY>` and similar) before it reaches any log record or the database.
+- **No signing, ever.** There is no private key handling, no transaction
+  construction, and no broadcast path in the codebase.
+- **Bounded retries.** Exponential backoff with jitter and a hard attempt cap.
+  Redirects are never followed — a 3xx is a failure, so a re-signed request
+  cannot be replayed to an attacker-controlled host.
+- **Integer money.** Wei values stay Python `int`. Floats never touch balances.
+- **Durable cursor.** Block progress is committed in the same SQLite
+  transaction as the block itself, so a crash cannot skip or double-count.
+- **Reorg handling that fails loudly.** A fork is detected by `parentHash`
+  mismatch, rolled back to the common ancestor inside `REORG_WINDOW`, and
+  rescanned. A fork deeper than the window raises instead of guessing.
+
+Full details: [docs/security-assessment.md](docs/security-assessment.md).
+
+## Configuration
+
+All configuration is environment-driven; see [`.env.example`](.env.example).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ETHEREUM_RPC_URL` | — | Endpoint. **Required** for any networked mode |
+| `EXPECTED_CHAIN_ID` | — | Chain id the node must report. **Required** for networked modes |
+| `CONFIRMATIONS` | `12` | Blocks behind head treated as final |
+| `START_BLOCK_LOOKBACK` | `20` | Blocks to look back on a fresh start |
+| `START_BLOCK` | unset | Explicit start block; overrides lookback |
+| `BLOCK_BATCH_SIZE` | `5` | Blocks per `--once` / per watch iteration |
+| `POLL_INTERVAL_SECONDS` | `12` | Watch-mode sleep between batches |
+| `REORG_WINDOW` | `64` | Max rollback depth before hard failure |
+| `STATE_DB_PATH` | `./data/state.db` | SQLite cursor + block store |
+| `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL` |
+| `RPC_TIMEOUT_SECONDS` | `20` | Per-request timeout |
+| `RPC_MAX_RETRIES` | `3` | Additional attempts after the first |
+
+`ETHEREUM_RPC_URL` and `EXPECTED_CHAIN_ID` are validated lazily: offline tooling
+and `--help` work without them, while `--check-rpc` / `--once` / `--watch` fail
+with an explicit message.
+
+## Logging
+
+One JSON object per line on stdout, which is what Filebeat → Wazuh, Loki or
+CloudWatch expects. Every record carries `timestamp`, `level`, `event`; the
+relevant ones add `chain_id`, `block_number`, `duration_ms`.
 
 ```json
-{"ts": "...", "level": "INFO", "event": "startup", "app": "web3-secops-lab"}
-{"ts": "...", "level": "INFO", "event": "config_loaded", "app_name": "web3-secops-lab", "log_level": "INFO"}
-{"ts": "...", "level": "INFO", "event": "shutdown", "status": "ok"}
+{"timestamp":"2026-11-12T09:41:32.109Z","level":"INFO","event":"block_scanned","logger":"web3_secops.block_scanner","chain_id":11155111,"block_number":10,"block_hash":"0x98c4...","tx_count":2,"is_new":true}
 ```
 
----
-
-## 测试
+## Tests
 
 ```bash
-pytest
+pytest -q          # 100 tests, fully offline
+ruff check .       # lint
+ruff format --check .
 ```
 
-测试覆盖 Week 1 的真实功能：配置读取（含默认值回退）、结构化日志输出、主流程执行。
+The suite is **offline by design**: every RPC call is intercepted with `respx`
+against a synthetic chain. No public endpoint is contacted, so the suite is
+deterministic and safe in CI. Reorg scenarios are reproducible because the test
+rewrites the synthetic chain mid-run.
 
-代码检查：
+Live-endpoint verification is a separate, manual step — see
+[docs/operations.md](docs/operations.md#live-rpc-verification).
 
-```bash
-ruff check .
+## Repository layout
+
+```
+src/web3_secops/
+  rpc_client.py      # M1-A: allowlisted read-only JSON-RPC client
+  block_scanner.py   # M1-B: cursor, reorg detection, SQLite store
+  config.py          # M1-C: env parsing and validation
+  main.py            # M1-C: CLI entry point
+  logging_setup.py   # JSON Lines logging
+tests/
+  conftest.py        # synthetic chain + fake node
+  test_rpc_client.py
+  test_block_scanner.py
+  test_main.py
+docs/
+  architecture.md
+  threat-model.md
+  security-assessment.md
+  operations.md
 ```
 
----
+## Documentation
 
-## 后续规划
+- [Architecture](docs/architecture.md) — how the pieces fit and why
+- [Threat model](docs/threat-model.md) — what this trusts, what it does not
+- [Security assessment](docs/security-assessment.md) — controls and their tests
+- [Operations](docs/operations.md) — running it, reorgs, live verification
 
-以下内容**尚未实现**，将在后续学习阶段逐步加入。列出仅为记录学习路线，不代表当前具备这些能力。
+## License
 
-- ⏳ **Week 2：Ethereum JSON-RPC** —— 学习连接节点、调用只读 RPC 方法读取链上数据（例如查询最新区块号）。
-- ⏳ **Week 3+：区块扫描** —— 遍历区块、读取交易。
-- ⏳ **Week 4+：ERC-20 事件解码** —— 解析 `Transfer` / `Approval` 等事件日志。
-- ⏳ **后续：链上安全检测** —— 识别异常交易模式。
-- ⏳ **后续：Wazuh 集成** —— 把结构化日志接入 Wazuh 做告警。
-- ⏳ **后续：部署** —— Docker / Docker Compose 部署。
-- ⏳ **后续：智能合约审计** —— 合约安全分析。
-
----
-
-## 许可证
-
-MIT，详见 [LICENSE](LICENSE)。
+MIT. See [LICENSE](LICENSE).
