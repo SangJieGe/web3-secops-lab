@@ -41,10 +41,12 @@ header of a 3xx or `error.message` in a JSON-RPC error.
 
 *Control:* `redact_url()` strips the last path segment (`/v2/<KEY>`,
 `/v3/<KEY>`, `/<KEY>`) and the whole query string. `Settings` exposes
-`safe_rpc_url`; only that value is ever logged. The URL is never written to the
-database. The real `.env` is git-ignored, and CI checks that no `.env` file is
-git-tracked (this is a tracked-file check only — it is **not** secret scanning,
-and no such claim is made).
+`safe_rpc_url`; only that value is ever logged. `RpcClient.url` is declared
+`field(repr=False)` so the dataclass repr cannot resurface the raw URL through a
+traceback or an f-string. The URL is never written to the database. The real
+`.env` is git-ignored, and CI checks that no `.env` file is git-tracked (this is
+a tracked-file check only — it is **not** secret scanning, and no such claim is
+made).
 
 Remote-controlled strings never reach a log verbatim: `Location` is reduced to a
 bare host with the path dropped, and `error.message` goes through

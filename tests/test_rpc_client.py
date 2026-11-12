@@ -413,11 +413,20 @@ def test_client_endpoint_is_redacted(client: RpcClient) -> None:
 
 
 def test_repr_does_not_expose_url(client: RpcClient) -> None:
-    """dataclass repr includes `url`; confirm we never rely on repr for logging."""
-    # The dataclass does expose url in repr — this test documents that fact so a
-    # future change does not accidentally start logging repr(client).
-    assert "TESTKEY123" in repr(client)
-    # ...which is why only `client.endpoint` is used in log calls (see above test).
+    """``repr(client)`` must not expose the API key.
+
+    A dataclass repr is easy to leak by accident: it lands in tracebacks,
+    debugger frames, and any f-string that formats the object. That is why
+    ``RpcClient.url`` is declared ``field(repr=False)``, and why ``.endpoint``
+    (redacted) is the only approved rendering.
+    """
+    rendered = repr(client)
+    assert "TESTKEY123" not in rendered, f"API key leaked into repr: {rendered}"
+    # The redacted accessor is still available and still safe.
+    assert "TESTKEY123" not in client.endpoint
+    assert client.endpoint.startswith("https://")
+    # The host survives redaction, so the value remains diagnosable.
+    assert "rpc.test.invalid" in client.endpoint
 
 
 # ===========================================================================

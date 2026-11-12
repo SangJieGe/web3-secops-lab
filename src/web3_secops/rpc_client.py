@@ -414,7 +414,11 @@ class RpcClient:
     ...     head = client.get_block_number()
     """
 
-    url: str
+    # ``repr=False`` keeps the raw endpoint out of tracebacks, debugger output and
+    # any f-string that formats a client. Dataclass reprs are otherwise an easy
+    # way to leak a URL that carries an API key; ``.endpoint`` is the redacted
+    # form and is the only project-approved way to render it.
+    url: str = field(repr=False)
     timeout: float = 20.0
     max_retries: int = 3
     base_backoff: float = 0.5

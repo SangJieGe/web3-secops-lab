@@ -43,9 +43,13 @@ jobs:
       - name: Format check (ruff)
         run: ruff format --check .
 
-      - name: Tests (offline, mocked RPC only)
-        # The suite must never reach the public internet: every RPC call is
-        # intercepted by respx. Any accidental live call would fail the job.
+      - name: "Tests (offline: mocked RPC + loopback HTTP)"
+        # No public network is used. Two mechanisms are involved, not one:
+        #   * in-process RPC calls are intercepted by respx — a missed mock fails
+        #     the test rather than dialling out;
+        #   * entrypoint tests run a real `python -m` subprocess with a real HTTP
+        #     client, but against tests/local_rpc_server.py bound to 127.0.0.1.
+        # Either way an accidental call to a public endpoint would fail the job.
         run: pytest -q --disable-warnings
 
       # Scope: this checks one thing only — that no file literally named `.env`

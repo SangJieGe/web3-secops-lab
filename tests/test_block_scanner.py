@@ -772,23 +772,20 @@ def test_reorg_respects_batch_limit_and_leaves_no_holes(db_path: Path) -> None:
             node.set_chain(fork_b)
             node.head = 70
 
-            # Every individual call must respect the batch limit, counting only
-            # blocks it actually committed.
+            # Every individual call must respect the batch limit. The metric is
+            # ``blocks_scanned`` — the count of blocks this call successfully
+            # committed — and not a cursor delta: after a rollback the cursor
+            # moves *backwards*, so ``last_block - before`` can be negative or
+            # understate the work done and would not test the limit at all.
             calls = 0
             saw_rollback = False
             while calls < 40:
                 calls += 1
-                before = scanner.store.get_last_block()
                 result = scanner.scan_once(head=70)
-                committed = 0 if result.last_block is None else result.last_block - before
                 if result.reorg_rollback_to is not None:
                     saw_rollback = True
-                # A rollback rewinds the cursor, so "committed" can be negative or
-                # small; what must never happen is more than `batch` new blocks in
-                # one call.
-                assert committed <= batch, (
-                    f"call {calls} committed {committed} blocks, limit is {batch} "
-                    f"(cursor {before} -> {result.last_block})"
+                assert 0 <= result.blocks_scanned <= batch, (
+                    f"call {calls} committed {result.blocks_scanned} blocks, limit is {batch}"
                 )
                 if result.caught_up and scanner.store.get_last_block() == 70:
                     break
@@ -842,12 +839,18 @@ def test_reorg_rewind_does_not_refund_commit_budget(db_path: Path) -> None:
             node.set_chain(fork_b)
             node.head = 70
 
-            before = scanner.store.get_last_block()
             result = scanner.scan_once(head=70)
-            committed = (result.last_block or before) - before
             assert result.reorg_rollback_to is not None
-            assert committed <= batch, (
-                f"one call committed {committed} blocks after a rollback, limit is {batch}"
+
+            # The fork sits at the start of the batch window, so after rewinding
+            # there is still a full batch of blocks ahead. If the rollback
+            # refunded the budget the call would have gone on to commit more
+            # than ``batch``; the assertion below is therefore on equality, not
+            # an upper bound — it proves the budget was *spent*, not merely
+            # under-used.
+            assert result.blocks_scanned == batch, (
+                f"expected the commit budget of {batch} to be exhausted, "
+                f"got {result.blocks_scanned}"
             )
         finally:
             scanner.store.close()

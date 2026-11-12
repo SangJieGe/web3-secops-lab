@@ -59,10 +59,13 @@ Cross-checking against a second provider is M2 work.
 The redacted form keeps scheme + host so logs remain useful for debugging
 ("which provider failed?") without leaking the key.
 
-`Settings.safe_rpc_url` is what gets logged. `RpcClient.__repr__` is overridden
-so an f-string of the client cannot leak either — `test_repr_does_not_expose_url`
-covers that, because `repr` leaking is the most common way redaction silently
-fails.
+`Settings.safe_rpc_url` is what gets logged. `RpcClient` additionally declares
+`url` as `field(repr=False)`, so the dataclass-generated `repr` — which lands in
+tracebacks, debugger frames and any f-string that formats the object — omits the
+endpoint entirely. `test_repr_does_not_expose_url` asserts that `TESTKEY123` is
+absent from `repr(client)` while `client.endpoint` still renders the redacted
+host. Before this was added the dataclass repr *did* contain the raw URL; the
+test used to document that exposure rather than forbid it, and has been inverted.
 
 The URL is never persisted to SQLite. `.env` is git-ignored; CI fails if a
 tracked `.env` ever appears.
