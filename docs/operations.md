@@ -78,7 +78,7 @@ logic, not the endpoint's behaviour.
 | State | What it proves | How to produce |
 | --- | --- | --- |
 | **MOCK TEST** | client/scanner logic against a synthetic chain | `pytest -q` |
-| **OFFLINE SUBPROCESS TEST** | a real `python -m` process through a real HTTP client, against a loopback stub | `pytest -q` (included in the 119) |
+| **OFFLINE SUBPROCESS TEST** | a real `python -m` process through a real HTTP client, against a loopback stub | `pytest -q` (included in the full suite) |
 | **LIVE RPC TEST** | the real endpoint answers the three read calls, and a real block round-trips into SQLite | `pytest -m integration` or the commands below |
 | **PRODUCTION DEPLOYMENT** | long-running, monitored, on real infra | *not done in M1* |
 

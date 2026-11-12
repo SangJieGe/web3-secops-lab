@@ -3,8 +3,10 @@
 A read-only on-chain security operations lab: collect Ethereum data safely, store
 it durably, and build toward SIEM-based detection.
 
-**Status: M1 complete.** M1 is the data-collection layer only. See
-[Scope and honesty](#scope-and-honesty) before assuming anything else works.
+**Status: M1 complete, M2-A complete.** M1 is the data-collection layer; M2-A
+adds a standalone event decoder. Log *collection* (M2-B) is not built, so
+nothing fetches logs yet. See [Scope and honesty](#scope-and-honesty) before
+assuming anything else works.
 
 ---
 
@@ -18,7 +20,7 @@ Ethereum / EVM  →  RPC Collector  →  Block Scanner  →  Event Decoder
                                                       →  Detection Engine
                                                       →  SIEM (Wazuh)
                                                       →  Alerting & IR
-                └────────── M1 (done) ──────────┘  └──── M2+ (not built) ────┘
+                └────────── M1 (done) ──────────┘  └── M2-A (done) ──┘
 ```
 
 | Stage | Component | Status |
@@ -26,20 +28,29 @@ Ethereum / EVM  →  RPC Collector  →  Block Scanner  →  Event Decoder
 | M1-A | Read-only JSON-RPC client, allowlisted methods | **Implemented** |
 | M1-B | Reorg-aware block scanner with SQLite cursor | **Implemented** |
 | M1-C | CLI (`--check-rpc` / `--once` / `--watch`), config, JSON Lines logs | **Implemented** |
-| M2 | Event decoder (ERC-20 / ERC-721 transfers, approvals) | Not started |
+| M2-A | Standalone event decoder (ERC-20/721 transfers, approvals) | **Implemented** |
+| M2-B | Log collection (`eth_getLogs`) and persistence | Not started |
 | M3 | Detection engine + Wazuh integration + alerting | Not started |
 
 ## Scope and honesty
 
-M1 **collects** blocks. It does **not**:
+M1 **collects** blocks. M2-A **decodes** log objects passed to it by a caller. It
+is *not* an event monitoring system — nothing in this repository fetches logs
+yet, so no on-chain event has ever been decoded end-to-end from a live node at
+this stage.
 
+This repository does **not**:
+
+- fetch logs (`eth_getLogs`) — that is M2-B, not built
+- persist decoded events — there is no events table
 - detect attacks, exploits or suspicious activity
-- decode ERC-20 / ERC-721 events
 - ship data to Wazuh or emit any alert
 - sign, broadcast, or custody anything
+- verify that a contract implements any token standard. A log whose layout
+  matches ERC-20 `Transfer` only means the bytes look like one; any contract can
+  emit that. See [docs/event-decoding.md](docs/event-decoding.md).
 
-If a future README claims otherwise, that claim is wrong. Everything in this
-repository is a read-only collector plus its tests.
+If a future README claims otherwise, that claim is wrong.
 
 ## Quick start
 
@@ -134,7 +145,7 @@ relevant ones add `chain_id`, `block_number`, `duration_ms`.
 ## Tests
 
 ```bash
-pytest -q          # 119 tests, fully offline
+pytest -q          # 221 tests, fully offline
 ruff check .       # lint
 ruff format --check .
 ```
@@ -146,7 +157,10 @@ The suite is **offline by design** and this is enforced, not just claimed:
   HTTP client, but the endpoint is a loopback JSON-RPC stub
   (`tests/local_rpc_server.py`) bound to `127.0.0.1` — never a public RPC host.
 * Verified by running the whole suite inside `unshare -rn` (a network namespace
-  with no route off the host): **119 passed** with only loopback up.
+  with no route off the host): **221 passed** with only loopback up.
+
+M1 contributes 119 tests; M2-A adds 102 decoder tests, which open no socket at
+all — they build logs from literal hex in-process.
 
 `pytest` contacts no public endpoint and requires no RPC API key, in CI or
 locally.
@@ -172,6 +186,7 @@ src/web3_secops/
   __main__.py        # M1-C: package entry (`python -m web3_secops`)
   rpc_client.py      # M1-A: allowlisted read-only JSON-RPC client
   block_scanner.py   # M1-B: cursor, reorg detection, SQLite store
+  event_decoder.py   # M2-A: standalone log → event decoder (no I/O)
   config.py          # M1-C: env parsing and validation
   main.py            # M1-C: CLI entry point
   logging_setup.py   # JSON Lines logging
@@ -182,11 +197,13 @@ tests/
   test_block_scanner.py
   test_main.py
   test_entrypoint.py # real subprocess, loopback endpoint, no public network
+  test_event_decoder.py  # M2-A: 102 offline decode/validation tests
 docs/
   architecture.md
   threat-model.md
   security-assessment.md
   operations.md
+  event-decoding.md  # M2-A: topic0, indexed vs data, why layout ≠ standard
 ```
 
 ## Documentation
@@ -195,6 +212,8 @@ docs/
 - [Threat model](docs/threat-model.md) — what this trusts, what it does not
 - [Security assessment](docs/security-assessment.md) — controls and their tests
 - [Operations](docs/operations.md) — running it, reorgs, live verification
+- [Event decoding](docs/event-decoding.md) — M2-A decoder, and why a matching
+  log layout does not prove a contract implements a standard
 
 ## License
 
