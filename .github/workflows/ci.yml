@@ -48,10 +48,14 @@ jobs:
         # intercepted by respx. Any accidental live call would fail the job.
         run: pytest -q --disable-warnings
 
-      - name: Guard — no secrets committed
+      # Scope: this checks one thing only — that no file literally named `.env`
+      # is tracked by git. It does NOT scan file contents, does NOT detect
+      # embedded credentials in source, and is NOT secret scanning. Treating a
+      # green run here as "no secrets in the repo" would be wrong.
+      - name: Guard — no tracked .env file
         run: |
           if git ls-files | grep -E '(^|/)\.env$'; then
             echo "::error::.env must not be committed"
             exit 1
           fi
-          echo "no .env tracked — ok"
+          echo "no .env tracked — ok (tracked-file check only)"

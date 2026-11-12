@@ -17,13 +17,14 @@ import respx
 
 from tests.conftest import TEST_URL, FakeNode, make_block, make_chain
 from web3_secops.block_scanner import (
+    BlockMismatchError,
     BlockScanner,
     ReorgOutOfWindowError,
     ScannerConfig,
     ScannerError,
     StateStore,
 )
-from web3_secops.rpc_client import RpcClient
+from web3_secops.rpc_client import RpcClient, RpcProtocolError
 
 CHAIN_ID = 11155111
 
@@ -483,6 +484,73 @@ def test_commit_block_is_atomic(db_path: Path) -> None:
         store.close()
 
 
+def test_commit_block_rolls_back_when_cursor_update_fails(db_path: Path) -> None:
+    """Mid-transaction failure must leave neither a block row nor a moved cursor.
+
+    The happy-path test above proves the commit works; it says nothing about what
+    happens when the transaction dies halfway. ``commit_block`` inserts into
+    ``blocks`` and then updates ``scan_state``. To prove those two writes are
+    genuinely atomic, a SQLite trigger is installed that raises the moment the
+    cursor is updated — i.e. *after* the block row has been written inside the
+    open transaction.
+
+    If the implementation were not transactional, the block row would survive
+    with a stale cursor, and a later scan would re-fetch and re-store it while
+    the cursor still pointed at the old height. That silent divergence is exactly
+    what this asserts cannot happen.
+    """
+    from web3_secops.rpc_client import normalize_block
+
+    store = StateStore(db_path, CHAIN_ID)
+    try:
+        # Seed one committed block so there is a real prior cursor to preserve.
+        assert store.commit_block(normalize_block(make_block(10))) is True
+        assert store.get_last_block() == 10
+        assert store.block_count() == 1
+
+        # Fail only when advancing to block 11: the INSERT for 10 already
+        # succeeded and is untouched, so the trigger cannot be confused with a
+        # general "block writes are broken" fault.
+        store._conn.execute(
+            """
+            CREATE TRIGGER fail_cursor_advance
+            BEFORE UPDATE ON scan_state
+            WHEN NEW.last_block = 11
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated cursor failure');
+            END
+            """
+        )
+        store._conn.commit()
+
+        with pytest.raises(sqlite3.Error):
+            store.commit_block(normalize_block(make_block(11)))
+
+        # The block row must not have survived the aborted transaction.
+        assert store.get_block(11) is None, "partial block row survived a failed commit"
+        assert store.block_count() == 1, "block row count changed despite rollback"
+
+        # The cursor must not have moved.
+        assert store.get_last_block() == 10, "cursor advanced despite a failed commit"
+
+        # The database must still be usable: drop the trigger and commit for real.
+        store._conn.execute("DROP TRIGGER fail_cursor_advance")
+        store._conn.commit()
+        assert store.commit_block(normalize_block(make_block(11))) is True
+        assert store.get_last_block() == 11
+        assert store.block_count() == 2
+    finally:
+        store.close()
+
+    # The database file must be intact and reopenable after the aborted write.
+    reopened = StateStore(db_path, CHAIN_ID)
+    try:
+        assert reopened.get_last_block() == 11
+        assert reopened.block_count() == 2
+    finally:
+        reopened.close()
+
+
 def test_rollback_to_moves_cursor_and_deletes_rows(db_path: Path) -> None:
     store = StateStore(db_path, CHAIN_ID)
     try:
@@ -555,5 +623,231 @@ def test_scan_to_head_runs_until_caught_up(db_path: Path) -> None:
             results = scanner.scan_to_head()
             assert results[-1].caught_up is True
             assert scanner.store.get_last_block() == 20
+        finally:
+            scanner.store.close()
+
+
+def test_block_mismatch_is_rejected_and_nothing_is_persisted(db_path: Path) -> None:
+    """A node answering block 100 with block 101 must be refused outright.
+
+    This is not a reorg and must not be treated as one: the block is simply
+    wrong. Nothing may be written and the cursor must not move, otherwise the
+    scanner would store block 101's contents under height 100 and skip the block
+    it never actually fetched.
+    """
+    blocks = make_chain(0, 120, fork="main")
+    node = FakeNode(chain_id=CHAIN_ID, head=120, blocks=blocks)
+
+    # Make the node answer a request for 100 with block 101's payload. The hash
+    # and parent hash stay consistent with 101 so only the height check can
+    # notice the substitution.
+    real_handler = node.handler
+
+    def lying_handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload.get("method") == "eth_getBlockByNumber":
+            params = payload.get("params") or []
+            if params and params[0] == hex(100):
+                payload = dict(payload)
+                payload["params"] = [hex(101), *params[1:]]
+                request = httpx.Request(
+                    method=request.method,
+                    url=request.url,
+                    headers=request.headers,
+                    content=json.dumps(payload).encode(),
+                )
+        return real_handler(request)
+
+    with respx.mock(base_url=TEST_URL) as router:
+        router.post(TEST_URL).mock(side_effect=lying_handler)
+        scanner = _scanner(node, db_path, block_batch_size=200, confirmations=0, start_block=100)
+        try:
+            # The client rejects a mismatched block before the scanner sees it,
+            # and the scanner re-checks independently. Either layer firing is
+            # acceptable; what matters is that the bad block never lands.
+            with pytest.raises((BlockMismatchError, RpcProtocolError)) as excinfo:
+                scanner.scan_once(head=120)
+
+            if isinstance(excinfo.value, BlockMismatchError):
+                assert excinfo.value.expected == 100
+                assert excinfo.value.received == 101
+            else:
+                assert "requested block 100" in str(excinfo.value)
+                assert "block 101" in str(excinfo.value)
+
+            # Nothing was written, and the cursor did not advance.
+            assert scanner.store.get_block(100) is None, "mismatched block was persisted"
+            assert scanner.store.get_block(101) is None, "wrong block was persisted"
+            assert scanner.store.block_count() == 0, "any row was written"
+            assert scanner.store.get_last_block() is None, "cursor was created by a bad block"
+        finally:
+            scanner.store.close()
+
+
+def test_mismatch_does_not_trigger_reorg_rollback(db_path: Path) -> None:
+    """A height mismatch must fail loudly, never roll back real history."""
+    blocks = make_chain(0, 120, fork="main")
+    node = FakeNode(chain_id=CHAIN_ID, head=120, blocks=blocks)
+
+    with respx.mock(base_url=TEST_URL) as router:
+        router.post(TEST_URL).mock(side_effect=node.handler)
+        scanner = _scanner(node, db_path, block_batch_size=200, confirmations=0, start_block=90)
+        try:
+            # Store 90..105 honestly first.
+            scanner.scan_once(head=105)
+            assert scanner.store.get_last_block() == 105
+            rows_before = scanner.store.block_count()
+        finally:
+            pass
+
+    # Now make the node lie about the next block.
+    real_handler = node.handler
+
+    def lying_handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload.get("method") == "eth_getBlockByNumber":
+            params = payload.get("params") or []
+            if params and params[0] is not None:
+                requested = int(params[0], 16)
+                if requested == 106:
+                    payload = dict(payload)
+                    payload["params"] = [hex(107), *params[1:]]
+                    request = httpx.Request(
+                        method=request.method,
+                        url=request.url,
+                        headers=request.headers,
+                        content=json.dumps(payload).encode(),
+                    )
+        return real_handler(request)
+
+    with respx.mock(base_url=TEST_URL) as router:
+        router.post(TEST_URL).mock(side_effect=lying_handler)
+        try:
+            with pytest.raises((BlockMismatchError, RpcProtocolError)):
+                scanner.scan_once(head=120)
+
+            # Rollback must not have happened: all previously stored rows intact.
+            assert scanner.store.block_count() == rows_before, "rows were deleted"
+            assert scanner.store.get_last_block() == 105, "cursor disturbed"
+        finally:
+            scanner.store.close()
+
+
+def test_reorg_respects_batch_limit_and_leaves_no_holes(db_path: Path) -> None:
+    """A deep reorg must not blow past ``block_batch_size`` in one call.
+
+    With a limit of 5 and a fork 12 blocks deep, a single ``scan_once`` cannot
+    both rescan the fork and stay within budget. It must commit at most 5 blocks,
+    and repeated calls must eventually restore every block on the winning chain
+    with no holes. The cursor is the only thing that carries state between calls,
+    so this also proves the resume point is correct.
+    """
+    batch = 5
+
+    fork_a = make_chain(0, 60, fork="main")
+    node = FakeNode(chain_id=CHAIN_ID, head=60, blocks=fork_a)
+
+    with respx.mock(base_url=TEST_URL) as router:
+        router.post(TEST_URL).mock(side_effect=node.handler)
+        scanner = _scanner(
+            node,
+            db_path,
+            block_batch_size=batch,
+            confirmations=0,
+            start_block=30,
+            reorg_window=64,
+        )
+        try:
+            # Scan forward honestly, batch by batch, until caught up.
+            for _ in range(20):
+                result = scanner.scan_once(head=60)
+                if result.caught_up:
+                    break
+            assert scanner.store.get_last_block() == 60
+
+            # --- fork 12 blocks deep: diverges at block 40 ---
+            fork_b = dict(fork_a)
+            fork_b.update(make_chain(40, 70, fork="b"))
+            fork_b[40]["parentHash"] = fork_a[39]["hash"]
+            node.set_chain(fork_b)
+            node.head = 70
+
+            # Every individual call must respect the batch limit, counting only
+            # blocks it actually committed.
+            calls = 0
+            saw_rollback = False
+            while calls < 40:
+                calls += 1
+                before = scanner.store.get_last_block()
+                result = scanner.scan_once(head=70)
+                committed = 0 if result.last_block is None else result.last_block - before
+                if result.reorg_rollback_to is not None:
+                    saw_rollback = True
+                # A rollback rewinds the cursor, so "committed" can be negative or
+                # small; what must never happen is more than `batch` new blocks in
+                # one call.
+                assert committed <= batch, (
+                    f"call {calls} committed {committed} blocks, limit is {batch} "
+                    f"(cursor {before} -> {result.last_block})"
+                )
+                if result.caught_up and scanner.store.get_last_block() == 70:
+                    break
+
+            assert saw_rollback, "the deep reorg was never detected"
+
+            # Coverage must be complete and entirely on the winning fork. The
+            # scan started at 30, so that is the earliest stored height.
+            assert scanner.store.get_last_block() == 70
+            for n in range(30, 71):
+                stored = scanner.store.get_block(n)
+                assert stored is not None, f"block {n} missing after incremental recovery"
+            for n in range(40, 71):
+                assert scanner.store.get_block(n).block_hash == fork_b[n]["hash"], (
+                    f"block {n} is not on the winning fork"
+                )
+        finally:
+            scanner.store.close()
+
+
+def test_reorg_rewind_does_not_refund_commit_budget(db_path: Path) -> None:
+    """A rollback must not buy extra work inside the same call.
+
+    If the budget were reset on rollback, a fork near the start of a batch would
+    let the call commit far more than ``block_batch_size`` blocks.
+    """
+    batch = 4
+    fork_a = make_chain(0, 60, fork="main")
+    node = FakeNode(chain_id=CHAIN_ID, head=60, blocks=fork_a)
+
+    with respx.mock(base_url=TEST_URL) as router:
+        router.post(TEST_URL).mock(side_effect=node.handler)
+        scanner = _scanner(
+            node,
+            db_path,
+            block_batch_size=batch,
+            confirmations=0,
+            start_block=30,
+            reorg_window=64,
+        )
+        try:
+            for _ in range(20):
+                if scanner.scan_once(head=60).caught_up:
+                    break
+            assert scanner.store.get_last_block() == 60
+
+            # Fork right at the start of the next batch window: diverge at 55.
+            fork_b = dict(fork_a)
+            fork_b.update(make_chain(55, 70, fork="c"))
+            fork_b[55]["parentHash"] = fork_a[54]["hash"]
+            node.set_chain(fork_b)
+            node.head = 70
+
+            before = scanner.store.get_last_block()
+            result = scanner.scan_once(head=70)
+            committed = (result.last_block or before) - before
+            assert result.reorg_rollback_to is not None
+            assert committed <= batch, (
+                f"one call committed {committed} blocks after a rollback, limit is {batch}"
+            )
         finally:
             scanner.store.close()

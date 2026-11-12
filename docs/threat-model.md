@@ -35,17 +35,31 @@ honest, or to avoid rate-limiting you at the worst moment.
 ### T1 — Leaking the RPC API key
 
 *Vector:* logging the endpoint, storing it in SQLite, or letting it into an
-exception message or a CI log.
+exception message or a CI log. A second, less obvious vector: the **remote peer**
+putting a credential-shaped string into a field we echo back — the `Location`
+header of a 3xx or `error.message` in a JSON-RPC error.
 
 *Control:* `redact_url()` strips the last path segment (`/v2/<KEY>`,
 `/v3/<KEY>`, `/<KEY>`) and the whole query string. `Settings` exposes
 `safe_rpc_url`; only that value is ever logged. The URL is never written to the
-database. The real `.env` is git-ignored, and CI fails if any `.env` is tracked.
+database. The real `.env` is git-ignored, and CI checks that no `.env` file is
+git-tracked (this is a tracked-file check only — it is **not** secret scanning,
+and no such claim is made).
+
+Remote-controlled strings never reach a log verbatim: `Location` is reduced to a
+bare host with the path dropped, and `error.message` goes through
+`_scrub_remote_text` (URL shapes redacted, long opaque tokens masked, then
+truncated). The error code and classification stay unmasked so failures remain
+diagnosable.
 
 *Tests:* `test_safe_rpc_url_redacts_key`,
 `test_redact_url_strips_keys` (nine URL shapes),
 `test_api_key_not_in_logs` (parses every emitted log record),
-`test_repr_does_not_expose_url`.
+`test_repr_does_not_expose_url`,
+`test_redirect_location_secret_absent_from_subprocess_output`,
+`test_rpc_error_message_secret_absent_from_subprocess_output` (both run a real
+`python -m` subprocess and grep stdout **and** stderr for the planted value,
+asserting zero hits while also asserting the output is still non-empty).
 
 *Residual risk:* a provider that embeds the key in a header echoed by a traceback
 would bypass path/query redaction. Accepted: the collector does not log headers.
@@ -85,6 +99,32 @@ mismatch is a reorg, not a silent overwrite. JSON-RPC payloads are never
 `test_non_object_response_rejected`, `test_both_result_and_error_rejected`,
 `test_neither_result_nor_error_rejected`, `test_malformed_quantity_rejected`.
 
+### T3a — Node returns a different height than requested
+
+*Vector:* a broken or hostile node answers `eth_getBlockByNumber("0x64")` with
+block `0x65`. The payload is internally consistent — correct hash, correct parent
+— so parent-hash checking cannot see anything wrong. Accepting it would store
+block 101's contents under height 100 and silently skip block 100 forever, and
+because the stored parent chain stays self-consistent, the corruption would never
+surface as a reorg.
+
+*Control:* the requested height is compared to the returned height at two
+independent layers — in `RpcClient.get_block()` before the scanner receives the
+block, and again in `BlockScanner.scan_once()` before the reorg check and before
+any write. A mismatch raises and is **never** routed into reorg rollback, because
+it is not evidence of a fork; treating it as one would delete perfectly good
+history on the basis of a bad response.
+
+*Tests:* `test_block_mismatch_is_rejected_and_nothing_is_persisted` (failure
+raises, no row for 100 or 101, cursor untouched),
+`test_mismatch_does_not_trigger_reorg_rollback` (previously stored rows are all
+still present after the failure).
+
+*Residual risk:* none identified for height substitution. A node that lies
+consistently across every block it serves is indistinguishable from a legitimate
+alternative chain; that is what T5 and cross-provider validation would address,
+and neither is in M1.
+
 ### T4 — Silent data loss (gaps or double counting)
 
 *Vector:* crash between "block fetched" and "cursor written"; or a reorg rollback
@@ -94,11 +134,23 @@ that skips the rewritten range.
 crash can commit one without the other. After a rollback the loop rewinds to
 `ancestor + 1` rather than continuing forward.
 
+`BLOCK_BATCH_SIZE` bounds how many blocks **one** `scan_once` call may commit, and
+a rollback does not refund that budget. A fork deeper than one batch therefore
+takes several calls to recover, with the cursor carrying the resume point — an
+unbounded recovery burst would otherwise be the easiest way to make a single
+`--once` call run for an arbitrarily long time.
+
 *Tests:* `test_commit_block_is_atomic`,
+`test_commit_block_rolls_back_when_cursor_update_fails` (SQLite trigger aborts the
+cursor update after the insert; asserts no surviving row, no moved cursor, DB
+still writable, file reopens),
 `test_cursor_does_not_advance_on_fetch_failure`,
 `test_cursor_resumes_after_restart`,
 `test_reorg_detected_and_scanner_recovers` (asserts blocks 40–60 present and
-hash-consistent after a fork with ancestor 39).
+hash-consistent after a fork with ancestor 39),
+`test_reorg_respects_batch_limit_and_leaves_no_holes` (batch 5, fork 12 deep, no
+call exceeds the limit, full coverage after repeated calls),
+`test_reorg_rewind_does_not_refund_commit_budget`.
 
 *Residual risk:* filesystem-level corruption; SQLite's own journal handles it.
 

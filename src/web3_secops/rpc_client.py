@@ -31,6 +31,7 @@ from __future__ import annotations
 import itertools
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -111,12 +112,21 @@ class RpcProtocolError(RpcError):
 
 
 class RpcResponseError(RpcError):
-    """The node returned a well-formed JSON-RPC ``error`` object."""
+    """The node returned a well-formed JSON-RPC ``error`` object.
+
+    ``message`` comes straight off the wire and is fully attacker-controlled: a
+    compromised or malicious node can echo the request URL — including its API
+    key — back inside it. It is therefore *not* interpolated into the exception
+    text. Only the numeric ``code`` appears in the message, which is enough to
+    diagnose the failure class; the raw text is kept on the attribute for
+    callers that explicitly opt in, and is sanitised before being stored.
+    """
 
     def __init__(self, code: int, message: str, data: Any = None) -> None:
-        super().__init__(f"RPC error {code}: {message}")
+        super().__init__(f"RPC error {code} (remote message withheld)")
         self.code = code
-        self.message = message
+        # Retained for debugging, but never rendered into a log line by default.
+        self.message = _scrub_remote_text(message)
         self.data = data
 
 
@@ -164,6 +174,116 @@ def redact_url(url: str) -> str:
     # Query strings are dropped entirely: they carry keys far more often than
     # they carry operationally useful information.
     return urlunsplit((parts.scheme, netloc, path, "", ""))
+
+
+# Keys that remote text is allowed to mention. Anything longer / more opaque is
+# treated as potential key material and replaced.
+_BENIGN_REMOTE_TOKENS = {
+    "invalid",
+    "argument",
+    "arguments",
+    "method",
+    "params",
+    "parameter",
+    "request",
+    "unauthorized",
+    "forbidden",
+    "missing",
+    "header",
+    "headers",
+    "project",
+    "projectid",
+    "apikey",
+    "api",
+    "key",
+    "rate",
+    "limit",
+    "exceeded",
+    "too",
+    "many",
+    "requests",
+    "internal",
+    "server",
+    "error",
+    "unknown",
+    "block",
+    "transaction",
+    "not",
+    "found",
+    "quantity",
+    "hex",
+}
+
+
+def _scrub_remote_text(text: Any, max_len: int = 200) -> str:
+    """Return a diagnostic-safe form of text that came off the wire.
+
+    Remote error messages are attacker-controlled. A hostile or compromised node
+    can put the caller's API key in one. This keeps the text useful for
+    debugging — the message is still readable — while removing anything that
+    looks like a URL, a long opaque token, or a hex blob.
+
+    This is deliberately lossy: it is *not* a general-purpose sanitiser, it just
+    guarantees that credential-shaped strings never survive.
+    """
+    if not isinstance(text, str):
+        return "<non-string remote text>"
+
+    out = text[:max_len]
+
+    # Any URL anywhere in the text: keep scheme+host, drop path/query entirely.
+    # A path is allowed only when it is a single known-benign route word.
+    def _url_sub(match: re.Match[str]) -> str:
+        return redact_url(match.group(0))
+
+    out = re.sub(r"https?://[^\s\"'<>]+", _url_sub, out)
+
+    # Any long high-entropy token (API keys, JWTs, hex blobs).
+    def _token_sub(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if token.lower() in _BENIGN_REMOTE_TOKENS:
+            return token
+        if len(token) >= 32 and re.fullmatch(r"[0-9a-fA-F]+", token):
+            return "<redacted>"
+        if len(token) >= 20 and re.search(r"\d", token) and re.search(r"[A-Za-z]", token):
+            return "<redacted>"
+        if "-" in token and token.count("-") >= 2 and len(token) >= 24:
+            # UUID-ish
+            return "<redacted>"
+        return token
+
+    out = re.sub(r"[A-Za-z0-9_\-\.]{16,}", _token_sub, out)
+    return out
+
+
+def _redirect_destination(location: str) -> str:
+    """Reduce a ``Location`` header to a log-safe host (or a placeholder).
+
+    A redirect target is chosen by the remote node, not by us, so it must never
+    be printed verbatim: a node under adversarial control can encode the
+    caller's API key in the path or query of the redirect it hands back. The
+    host alone is enough to tell an operator "something is rewriting our
+    traffic", which is the only actionable signal here.
+    """
+    if not location:
+        return "<no location>"
+
+    try:
+        parts = urlsplit(location)
+    except ValueError:
+        return "<unparseable location>"
+
+    host = parts.hostname
+    if not host:
+        # Relative redirect, e.g. "/v2/key" or "//host/path". No host to show.
+        return "<relative location>"
+
+    netloc = host
+    if parts.port:
+        netloc = f"{host}:{parts.port}"
+    if parts.scheme:
+        return f"{parts.scheme}://{netloc}/<redacted-path>"
+    return f"//{netloc}/<redacted-path>"
 
 
 # ---------------------------------------------------------------------------
@@ -480,10 +600,17 @@ class RpcClient:
                 # follow_redirects=False, so a 3xx arrives here intact. Treat it
                 # as a hard failure: chasing it would re-send the request —
                 # including any key in the URL — to a host we did not choose.
+                #
+                # The Location header is fully attacker-controlled and may
+                # itself contain the caller's credential (a redirect designed to
+                # exfiltrate it). Only the destination host is retained, which
+                # is the one diagnostic detail worth having; the path and query
+                # are dropped wholesale.
+                location = response.headers.get("location", "")
+                safe_dest = _redirect_destination(location)
                 raise RpcError(
-                    f"{method}: unexpected HTTP {response.status_code} redirect to "
-                    f"{response.headers.get('location', '<no location>')!r}; "
-                    f"refusing to follow"
+                    f"{method}: unexpected HTTP {response.status_code} redirect "
+                    f"to {safe_dest}; refusing to follow"
                 )
 
             if response.status_code >= 400:
@@ -549,12 +676,26 @@ class RpcClient:
         empty transaction tuple only if the node returns hashes — which
         :func:`normalize_block` rejects. Callers that want raw JSON should use
         :meth:`get_raw_block`.
+
+        When ``block`` is a concrete height, the returned block's own ``number``
+        must equal it. Without this check a faulty, lagging, or malicious node
+        can answer block 100 with the contents of block 101 (or 99), and the
+        scanner would happily persist the wrong block under the key it asked
+        for — corrupting the chain of parent hashes that reorg detection depends
+        on, and advancing the cursor past a block that was never stored.
         """
         tag = _to_block_tag(block)
         result = self.call("eth_getBlockByNumber", [tag, full_transactions])
         if result is None:
             raise RpcProtocolError(f"block {tag} not found (node returned null)")
-        return normalize_block(result)
+        normalized = normalize_block(result)
+
+        if isinstance(block, int) and normalized.number != block:
+            raise RpcProtocolError(
+                f"requested block {block} but node returned block {normalized.number} "
+                f"(hash {normalized.hash[:10]}…); refusing to use a mismatched block"
+            )
+        return normalized
 
     def get_raw_block(self, block: BlockTag, full_transactions: bool = True) -> dict[str, Any]:
         """``eth_getBlockByNumber`` → the raw dict, unvalidated.

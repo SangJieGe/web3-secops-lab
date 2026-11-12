@@ -48,8 +48,13 @@ packages = ["src/web3_secops"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -q"
 filterwarnings = ["error::DeprecationWarning"]
+markers = [
+    "integration: hits a real public RPC endpoint; excluded from the default run",
+]
+# The default run must be fully offline: no network, no RPC credentials. Tests
+# against a real node are opt-in with `pytest -m integration`.
+addopts = "-ra -q -m 'not integration'"
 
 [tool.ruff]
 line-length = 100

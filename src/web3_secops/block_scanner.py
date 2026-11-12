@@ -98,6 +98,25 @@ class ParentHashMismatchError(ScannerError):
     """The parent hash of a block does not match the previously stored block."""
 
 
+class BlockMismatchError(ScannerError):
+    """The node returned a block whose height differs from the one requested.
+
+    This is a hard failure, not a reorg. A node that answers block 100 with
+    block 101 has broken the JSON-RPC contract; treating it as a reorg would
+    roll back real history, and committing it would store the wrong block under
+    the requested height and advance the cursor over a block never seen.
+    """
+
+    def __init__(self, expected: int, received: int, block_hash: str = "") -> None:
+        super().__init__(
+            f"requested block {expected} but node returned block {received} "
+            f"(hash {block_hash[:10]}…); refusing to persist or advance the cursor"
+        )
+        self.expected = expected
+        self.received = received
+        self.block_hash = block_hash
+
+
 # ---------------------------------------------------------------------------
 # Domain
 # ---------------------------------------------------------------------------
@@ -515,9 +534,31 @@ class BlockScanner:
         last: int | None = None
         rollback_to: int | None = None
 
+        # ``block_batch_size`` bounds the number of blocks *successfully
+        # committed* by a single call, which is what the operator budgets for.
+        # A reorg rewinds ``number`` without committing anything, so a naive
+        # ``number <= end`` loop can commit more than the limit when a fork is
+        # found mid-batch. Budget the commits explicitly instead: the loop stops
+        # once the budget is spent, and because the cursor only ever advances by
+        # committed blocks, the next call resumes at exactly the first block
+        # that was not committed. No hole can open up.
+        budget = self.config.block_batch_size
         number = start
-        while number <= end:
+        while number <= end and scanned < budget:
             block = self.client.get_block(number)
+
+            # Defence in depth: the client already rejects a block whose number
+            # does not match the request, but the scanner is the component that
+            # writes rows and moves the cursor, so it re-checks before touching
+            # either. A mismatched block must not reach reorg detection (which
+            # would interpret the wrong parent hash as a chain reorganisation)
+            # and must not be committed.
+            if block.number != number:
+                raise BlockMismatchError(
+                    expected=number,
+                    received=block.number,
+                    block_hash=block.hash,
+                )
 
             ancestor = self._detect_reorg(block)
             if ancestor is not None:
@@ -534,6 +575,12 @@ class BlockScanner:
                 # the ancestor and the block where the fork was noticed, e.g.
                 # ancestor=39 and a mismatch first seen at 44 would never fetch
                 # 40..43 again.
+                #
+                # The commit budget is deliberately *not* refunded here: rolling
+                # back deleted rows, but this call has already spent its window
+                # on the fork. The uncommitted range is picked up by the next
+                # call from the rewound cursor, so the total work stays bounded
+                # while the coverage stays complete.
                 number = ancestor + 1
                 if number > end:
                     # The fork was found at the very edge of this batch; the

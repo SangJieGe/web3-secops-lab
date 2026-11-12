@@ -101,7 +101,11 @@ def run_check_rpc(settings: Settings) -> int:
         expected = settings.expected_chain_id
         matches = expected is None or chain_id == expected
 
-        log.info(
+        # A chain-id mismatch means we are talking to the wrong network, which
+        # is a setup error, not a successful check. Logging it at INFO made a
+        # misconfigured run look identical to a healthy one.
+        log_fn = log.info if matches else log.error
+        log_fn(
             "rpc_check_ok" if matches else "rpc_check_chain_mismatch",
             chain_id=chain_id,
             expected_chain_id=expected,

@@ -70,7 +70,7 @@ python -m web3_secops --watch
 One batch per `POLL_INTERVAL_SECONDS`. `Ctrl-C` exits 130 cleanly, with the
 cursor at a committed block.
 
-## Live RPC verification
+## Test states
 
 Distinguishing the three states matters — a mocked test proves the client's
 logic, not the endpoint's behaviour.
@@ -78,10 +78,27 @@ logic, not the endpoint's behaviour.
 | State | What it proves | How to produce |
 | --- | --- | --- |
 | **MOCK TEST** | client/scanner logic against a synthetic chain | `pytest -q` |
-| **LIVE RPC TEST** | the real endpoint answers the three read calls, and a real block round-trips into SQLite | commands below |
+| **OFFLINE SUBPROCESS TEST** | a real `python -m` process through a real HTTP client, against a loopback stub | `pytest -q` (included in the 119) |
+| **LIVE RPC TEST** | the real endpoint answers the three read calls, and a real block round-trips into SQLite | `pytest -m integration` or the commands below |
 | **PRODUCTION DEPLOYMENT** | long-running, monitored, on real infra | *not done in M1* |
 
-A live check, against a free public endpoint:
+### What CI actually runs
+
+CI runs `pytest -q`, which is **fully offline**: no public RPC host is contacted
+and no RPC API key is configured. The subprocess entry-point tests do use a real
+HTTP client — pointed at `127.0.0.1` (`tests/local_rpc_server.py`). This can be
+verified by running the suite inside a network namespace with no external route:
+
+```bash
+unshare -rn sh -c 'ip link set lo up; pytest -q'
+```
+
+The integration tests are excluded by default (`-m "not integration"` in
+`pyproject.toml`) so a shared, rate-limited public endpoint cannot make CI flaky.
+
+### Live RPC verification (manual)
+
+A live check, against a free public endpoint. This is **not** part of CI:
 
 ```bash
 export ETHEREUM_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
@@ -94,6 +111,9 @@ export BLOCK_BATCH_SIZE=3
 python -m web3_secops --check-rpc
 python -m web3_secops --once
 ```
+
+`python -m web3_secops.main --check-rpc` is equivalent and still supported;
+`--check-rpc` and `--once` are the read-only smoke checks.
 
 Then verify the cursor actually persisted:
 

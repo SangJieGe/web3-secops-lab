@@ -134,23 +134,42 @@ relevant ones add `chain_id`, `block_number`, `duration_ms`.
 ## Tests
 
 ```bash
-pytest -q          # 100 tests, fully offline
+pytest -q          # 119 tests, fully offline
 ruff check .       # lint
 ruff format --check .
 ```
 
-The suite is **offline by design**: every RPC call is intercepted with `respx`
-against a synthetic chain. No public endpoint is contacted, so the suite is
-deterministic and safe in CI. Reorg scenarios are reproducible because the test
-rewrites the synthetic chain mid-run.
+The suite is **offline by design** and this is enforced, not just claimed:
 
-Live-endpoint verification is a separate, manual step — see
-[docs/operations.md](docs/operations.md#live-rpc-verification).
+* Every in-process RPC call is intercepted with `respx` against a synthetic chain.
+* The subprocess entry-point tests run a real `python -m` process against a real
+  HTTP client, but the endpoint is a loopback JSON-RPC stub
+  (`tests/local_rpc_server.py`) bound to `127.0.0.1` — never a public RPC host.
+* Verified by running the whole suite inside `unshare -rn` (a network namespace
+  with no route off the host): **119 passed** with only loopback up.
+
+`pytest` contacts no public endpoint and requires no RPC API key, in CI or
+locally.
+
+### Live-endpoint verification (manual, opt-in)
+
+Testing against real Sepolia is kept out of the default run because a shared
+public endpoint is rate-limited and would make CI flaky. It is a marked
+integration test that must be requested explicitly:
+
+```bash
+pytest -m integration -v          # hits a real public RPC endpoint
+```
+
+This is a manual pre-release check, not part of CI. See
+[docs/operations.md](docs/operations.md#live-rpc-verification) for the full
+procedure.
 
 ## Repository layout
 
 ```
 src/web3_secops/
+  __main__.py        # M1-C: package entry (`python -m web3_secops`)
   rpc_client.py      # M1-A: allowlisted read-only JSON-RPC client
   block_scanner.py   # M1-B: cursor, reorg detection, SQLite store
   config.py          # M1-C: env parsing and validation
@@ -158,9 +177,11 @@ src/web3_secops/
   logging_setup.py   # JSON Lines logging
 tests/
   conftest.py        # synthetic chain + fake node
+  local_rpc_server.py  # loopback JSON-RPC stub for subprocess tests
   test_rpc_client.py
   test_block_scanner.py
   test_main.py
+  test_entrypoint.py # real subprocess, loopback endpoint, no public network
 docs/
   architecture.md
   threat-model.md

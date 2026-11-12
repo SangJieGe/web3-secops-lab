@@ -12,8 +12,10 @@ hardening that M1 does not provide.
 | RPC key redaction | Strong — path + query | `test_redact_url_strips_keys` |
 | No signing path | Structural — no code exists | `test_allowlist_contents` |
 | Response validation | Strong — id, version, shape | `test_id_mismatch_detected` |
-| Transactional cursor | Strong — single SQLite txn | `test_commit_block_is_atomic` |
-| Reorg handling | Strong within window | `test_reorg_detected_and_scanner_recovers` |
+| Transactional cursor | Strong — single SQLite txn, rollback proven | `test_commit_block_is_atomic`, `test_commit_block_rolls_back_when_cursor_update_fails` |
+| Requested vs returned height | Strong — rejected in client and scanner | `test_block_mismatch_is_rejected_and_nothing_is_persisted` |
+| Reorg handling | Strong within window, batch-bounded | `test_reorg_detected_and_scanner_recovers`, `test_reorg_respects_batch_limit_and_leaves_no_holes` |
+| Remote text in errors/logs | Strong — host-only, scrubbed | `test_redirect_location_secret_absent_from_subprocess_output` |
 | Deep-reorg refusal | Strong — fail closed | `test_deep_reorg_beyond_window_raises` |
 | Retry bounds | Strong — capped, jittered | `test_retries_exhausted_raises` |
 | Redirect refusal | Strong — 3xx is an error | `test_redirect_not_followed` |
@@ -106,8 +108,32 @@ Both writes commit or neither does. A `SIGKILL` between them leaves the cursor
 where it was, so the block is refetched — duplicate work, never a gap. Re-scanning
 the same block is idempotent (`is_new: false`, `test_rescan_of_same_block_is_idempotent`).
 
+The happy path alone proves nothing about the failure path, so the rollback is
+tested directly: `test_commit_block_rolls_back_when_cursor_update_fails` installs
+a SQLite trigger that aborts the `scan_state` update *after* the `blocks` insert
+has already executed inside the open transaction. It asserts the block row did
+not survive, the cursor did not move, the DB is still writable afterwards, and
+the file reopens intact.
+
 `chain_id` is part of both primary keys, so a single DB can hold two chains
 without cursor collision (`test_chain_ids_are_isolated`).
+
+## C5b — Requested height must equal returned height
+
+A node that answers a request for block *N* with block *M* is not a reorg — it is
+a broken or hostile peer. Using the response anyway would store *M*'s contents
+under height *N* and silently skip *N*.
+
+Checked twice, independently:
+
+* `RpcClient.get_block(n)` — rejects the response before the scanner sees it
+  (`RpcProtocolError`).
+* `BlockScanner.scan_once()` — re-asserts `block.number == n` before the reorg
+  check and before any write (`BlockMismatchError`).
+
+A mismatch never enters reorg rollback, never writes to SQLite, and never advances
+the cursor. Proof: `test_block_mismatch_is_rejected_and_nothing_is_persisted`
+and `test_mismatch_does_not_trigger_reorg_rollback`.
 
 ## C6 — Reorg handling
 
@@ -128,6 +154,15 @@ block where the fork was *noticed*, permanently skipping the rewritten range.
 The current implementation rewinds, and
 `test_reorg_detected_and_scanner_recovers` asserts every block in the rewritten
 range exists afterwards with the new fork's hash.
+
+`BLOCK_BATCH_SIZE` is the maximum number of blocks a **single** `scan_once` call
+may commit, and the rewind does not refund that budget — a rollback near the
+start of a batch cannot be used to do extra work in the same call. Recovery from
+a fork deeper than one batch therefore takes several calls, each bounded, and the
+cursor carries the resume point between them. Proven by
+`test_reorg_respects_batch_limit_and_leaves_no_holes` (batch of 5, fork 12 deep,
+repeated calls, full coverage asserted over the whole range) and
+`test_reorg_rewind_does_not_refund_commit_budget`.
 
 If no common ancestor is found within `REORG_WINDOW`, `ReorgOutOfWindowError` is
 raised and the process exits 4. Guessing here would silently mix two forks in
@@ -182,6 +217,40 @@ stdlib-reserved attributes, so a caller cannot accidentally shadow `level` or
 
 Log content never includes: the raw RPC URL, request bodies, or response bodies.
 Only counts, block numbers, hashes and durations.
+
+### Remote-controlled strings are treated as hostile
+
+Two fields arrive verbatim from the remote peer and cannot be trusted to be
+well-formed or free of secrets:
+
+* the `Location` header on a 3xx response
+* `error.message` inside a JSON-RPC error object
+
+A malicious or compromised endpoint can put a credential, or a string that looks
+like one, in either field. Passing them through unchanged would let the peer
+exfiltrate a key into our logs — and a key it already knows, in the case of the
+URL, is worse: it is a "did this key leak?" oracle.
+
+Handling:
+
+* `Location` is reduced to a bare host plus a fixed note that the path was
+  dropped. The value is never echoed; only the destination host survives, and
+  only if it parses.
+* `error.message` is passed through `_scrub_remote_text`, which redacts anything
+  URL-shaped and masks long opaque tokens, then truncated. The numeric error
+  code and the fixed classification are logged unmasked so the failure is still
+  diagnosable.
+* Neither string is ever interpolated into a log record verbatim.
+
+Proof is a **subprocess** test, not a unit assertion: the loopback stub
+(`tests/local_rpc_server.py`) returns a redirect carrying
+`FAKE_SUPER_SECRET_12345` and a JSON-RPC error whose message carries the same
+value. A real `python -m` process is run against it and the test greps
+**stdout and stderr together** for the secret, asserting zero hits:
+`test_redirect_location_secret_absent_from_subprocess_output` and
+`test_rpc_error_message_secret_absent_from_subprocess_output`. The same tests
+assert the output is still non-empty and still carries diagnostic value, so the
+fix cannot be satisfied by deleting logging.
 
 ## Honest limitations
 
