@@ -402,7 +402,7 @@ def test_transfer_with_five_topics_is_rejected() -> None:
         data="0x",
     )
 
-    with pytest.raises(LogDecodeError, match=r"topics: Transfer must have 3"):
+    with pytest.raises(LogDecodeError, match=r"topics: expected at most 4 entries, got 5"):
         decode_log(log, CHAIN_ID)
 
 
@@ -431,7 +431,9 @@ def test_erc20_transfer_data_of_64_bytes_is_rejected() -> None:
         data="0x" + "00" * 64,
     )
 
-    with pytest.raises(LogDecodeError, match=r"data: ERC-20 Transfer requires exactly 32"):
+    # 130 raw chars exceeds the 66-char ceiling, so it is rejected on size before
+    # the ERC-20 layout check ever runs.
+    with pytest.raises(LogDecodeError, match=r"data: exceeds 66 chars, got 130"):
         decode_log(log, CHAIN_ID)
 
 
@@ -846,3 +848,230 @@ def test_decode_logs_does_not_return_partial_result_on_error() -> None:
         result = decode_logs(logs, CHAIN_ID)
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Trailing-newline bypass (P1)
+#
+# ``re``'s ``$`` matches immediately before a trailing newline, so a field of the
+# right length could end in "\n" and still pass a ``^...$`` match. These tests pin
+# the boundary: every hex-shaped field must be fully matched, no exceptions.
+# ---------------------------------------------------------------------------
+def _erc20_transfer_log(**overrides: Any) -> dict[str, Any]:
+    """A valid ERC-20 Transfer, for tests that only break one specific field."""
+    base: dict[str, Any] = {
+        "address": CONTRACT,
+        "topics": [TRANSFER_TOPIC0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR)],
+        "data": uint_data(1),
+        "blockNumber": "0x1e240",
+        "blockHash": BLOCK_HASH,
+        "transactionHash": TX_HASH,
+        "transactionIndex": "0x2",
+        "logIndex": "0x5",
+        "removed": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_contract_address_with_trailing_newline_is_rejected() -> None:
+    """39 valid hex chars + "\n" is still 42 chars, so length alone cannot catch it."""
+    bad = "0x" + "1" * 39 + "\n"
+    assert len(bad) == 42, "precondition: the string must satisfy the length check"
+
+    with pytest.raises(LogDecodeError, match=r"address: must be hex-encoded"):
+        decode_log(_erc20_transfer_log(address=bad), CHAIN_ID)
+
+
+def test_block_hash_with_trailing_newline_is_rejected() -> None:
+    """63 valid hex chars + "\n" is still 66 chars."""
+    bad = "0x" + "a" * 63 + "\n"
+    assert len(bad) == 66, "precondition: the string must satisfy the length check"
+
+    with pytest.raises(LogDecodeError, match=r"blockHash: must be hex-encoded"):
+        decode_log(_erc20_transfer_log(blockHash=bad), CHAIN_ID)
+
+
+def test_transaction_hash_with_trailing_newline_is_rejected() -> None:
+    bad = "0x" + "b" * 63 + "\n"
+    assert len(bad) == 66, "precondition: the string must satisfy the length check"
+
+    with pytest.raises(LogDecodeError, match=r"transactionHash: must be hex-encoded"):
+        decode_log(_erc20_transfer_log(transactionHash=bad), CHAIN_ID)
+
+
+def test_topic0_with_trailing_newline_is_rejected() -> None:
+    """topic0 identifies the event, so it is shape-checked before dispatch."""
+    bad_topic0 = TRANSFER_TOPIC0 + "\n"
+
+    with pytest.raises(LogDecodeError, match=r"topics\[0\]: must be 66 chars"):
+        decode_log(
+            _erc20_transfer_log(topics=[bad_topic0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR)]),
+            CHAIN_ID,
+        )
+
+
+def test_indexed_address_topic_with_trailing_newline_is_rejected() -> None:
+    """An indexed address must not decode to a value carrying a newline."""
+    bad_from = addr_topic(FROM_ADDR) + "\n"
+
+    with pytest.raises(LogDecodeError, match=r"topics\[1\]: must be 66 chars"):
+        decode_log(
+            _erc20_transfer_log(topics=[TRANSFER_TOPIC0, bad_from, addr_topic(TO_ADDR)]), CHAIN_ID
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_quantity",
+    ["0x1\n", "0x1\r\n", " 0x1", "0x1 ", "\t0x1", "0x1\t", "\n0x1"],
+)
+def test_quantities_with_surrounding_whitespace_are_rejected(bad_quantity: str) -> None:
+    """blockNumber, transactionIndex and logIndex all reject stray whitespace."""
+    for field in ("blockNumber", "transactionIndex", "logIndex"):
+        with pytest.raises(LogDecodeError, match=rf"{field}:"):
+            decode_log(_erc20_transfer_log(**{field: bad_quantity}), CHAIN_ID)
+
+
+def test_quantity_with_trailing_newline_does_not_decode_to_a_valid_number() -> None:
+    """The specific bug P1 fixed: "0x1\n" used to decode to 1 and be accepted."""
+    with pytest.raises(LogDecodeError, match=r"blockNumber:"):
+        decode_log(_erc20_transfer_log(blockNumber="0x1\n"), CHAIN_ID)
+
+
+@pytest.mark.parametrize("field", ["blockNumber", "transactionIndex", "logIndex"])
+def test_uppercase_0X_prefix_is_rejected(field: str) -> None:
+    """JSON-RPC spells the prefix lowercase; "0X" is not the same string."""
+    with pytest.raises(LogDecodeError, match=rf"{field}: must be 0x-prefixed"):
+        decode_log(_erc20_transfer_log(**{field: "0X1"}), CHAIN_ID)
+
+
+def test_uppercase_0X_address_prefix_is_rejected() -> None:
+    with pytest.raises(LogDecodeError, match=r"address: must be 0x-prefixed"):
+        decode_log(_erc20_transfer_log(address="0X" + "11" * 20), CHAIN_ID)
+
+
+def test_data_with_trailing_newline_is_rejected() -> None:
+    bad_data = "0x" + "00" * 31 + "01\n"
+
+    with pytest.raises(LogDecodeError, match=r"data:"):
+        decode_log(_erc20_transfer_log(data=bad_data), CHAIN_ID)
+
+
+def test_uppercase_hex_digits_are_still_accepted_and_normalised() -> None:
+    """Uppercase digits are legitimate hex; only the 0x prefix is case-sensitive."""
+    log = _erc20_transfer_log(
+        address="0x" + "AB" * 20,
+        blockHash="0x" + "CD" * 32,
+        transactionHash="0x" + "EF" * 32,
+        topics=[
+            "0x" + TRANSFER_TOPIC0[2:].upper(),
+            "0x" + addr_topic(FROM_ADDR)[2:].upper(),
+            addr_topic(TO_ADDR),
+        ],
+        data="0x" + "00" * 31 + "0A",
+    )
+
+    event = decode_log(log, CHAIN_ID)
+
+    assert event is not None
+    assert event.contract_address == "0x" + "ab" * 20
+    assert event.block_hash == "0x" + "cd" * 32
+    assert event.transaction_hash == "0x" + "ef" * 32
+    assert event.args["value"] == 10
+    # Everything emitted is lowercase, with no stray characters.
+    assert "\n" not in event.contract_address
+    for value in (event.contract_address, event.block_hash, event.transaction_hash):
+        assert value == value.lower()
+
+
+def test_quantity_zero_is_still_accepted() -> None:
+    """ "0x0" is the one legitimate zero; the no-leading-zero rule must not break it."""
+    event = decode_log(_erc20_transfer_log(logIndex="0x0"), CHAIN_ID)
+
+    assert event is not None
+    assert event.log_index == 0
+
+
+# ---------------------------------------------------------------------------
+# Input size bounds (P2)
+#
+# Bounds are enforced before conversion/allocation: a known event's topic list and
+# data are bounded, and quantities are capped at 64 hex digits.
+# ---------------------------------------------------------------------------
+def test_transfer_with_many_topics_is_rejected_before_validation() -> None:
+    """1000 topics must fail on count, not on 1000 individual validations."""
+    topics = [TRANSFER_TOPIC0] + [addr_topic(FROM_ADDR)] * 999
+
+    with pytest.raises(LogDecodeError, match=r"topics: expected at most 4 entries, got 1000"):
+        decode_log(_erc20_transfer_log(topics=topics), CHAIN_ID)
+
+
+def test_approval_with_five_topics_is_rejected() -> None:
+    topics = [
+        APPROVAL_TOPIC0,
+        addr_topic(FROM_ADDR),
+        addr_topic(TO_ADDR),
+        uint_topic(1),
+        uint_topic(2),
+    ]
+
+    with pytest.raises(LogDecodeError, match=r"topics: expected at most 4 entries, got 5"):
+        decode_log(_erc20_transfer_log(topics=topics), CHAIN_ID)
+
+
+def test_approval_for_all_with_four_topics_is_rejected() -> None:
+    """ApprovalForAll accepts exactly 3 topics, so 4 is over the bound."""
+    topics = [APPROVAL_FOR_ALL_TOPIC0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR), uint_topic(1)]
+
+    with pytest.raises(LogDecodeError, match=r"topics: expected at most 3 entries, got 4"):
+        decode_log(_erc20_transfer_log(topics=topics, data=uint_data(1)), CHAIN_ID)
+
+
+def test_data_longer_than_32_bytes_is_rejected_before_decoding() -> None:
+    """A 1 KB payload must be refused on length, not decoded into memory first."""
+    huge = "0x" + "00" * 1024
+
+    with pytest.raises(LogDecodeError, match=r"data: exceeds 66 chars, got 2050"):
+        decode_log(_erc20_transfer_log(data=huge), CHAIN_ID)
+
+
+def test_quantity_longer_than_64_hex_digits_is_rejected() -> None:
+    with pytest.raises(LogDecodeError, match=r"blockNumber: exceeds 64 hex digits, got 65"):
+        decode_log(_erc20_transfer_log(blockNumber="0x" + "f" * 65), CHAIN_ID)
+
+
+def test_quantity_of_exactly_64_hex_digits_is_accepted() -> None:
+    """The 64-digit cap must not reject a legitimate uint256-sized quantity."""
+    value = "0x" + "f" * 64
+
+    event = decode_log(_erc20_transfer_log(blockNumber=value), CHAIN_ID)
+
+    assert event is not None
+    assert event.block_number == int("f" * 64, 16)
+
+
+def test_unknown_topic0_with_oversized_topic_list_still_returns_none() -> None:
+    """An unsupported event stays out of scope even if its shape is absurd."""
+    log = _erc20_transfer_log(
+        topics=[UNKNOWN_TOPIC0] + [addr_topic(FROM_ADDR)] * 50, data="0x" + "00" * 500
+    )
+
+    assert decode_log(log, CHAIN_ID) is None
+
+
+@pytest.mark.parametrize(
+    ("topics", "data"),
+    [
+        ([TRANSFER_TOPIC0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR)], uint_data(10**18)),
+        ([TRANSFER_TOPIC0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR), uint_topic(7)], "0x"),
+        ([APPROVAL_TOPIC0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR)], uint_data(2**255)),
+        ([APPROVAL_TOPIC0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR), uint_topic(9)], "0x"),
+        ([APPROVAL_FOR_ALL_TOPIC0, addr_topic(FROM_ADDR), addr_topic(TO_ADDR)], uint_data(1)),
+    ],
+)
+def test_size_bounds_do_not_reject_any_legitimate_event(topics: list[str], data: str) -> None:
+    """All five supported layouts still decode after the new bounds were added."""
+    event = decode_log(_erc20_transfer_log(topics=topics, data=data), CHAIN_ID)
+
+    assert event is not None
+    assert event.args

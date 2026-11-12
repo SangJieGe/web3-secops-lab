@@ -115,18 +115,37 @@ Every field of a log is attacker-controlled, so everything is checked and
 nothing is repaired. There is no truncation, no zero-padding of short values, no
 guessing.
 
+Two properties are worth calling out because they are easy to get wrong:
+
+* **Whole-string matching.** Shapes are validated with `fullmatch`, never
+  `^...$`. In Python, `$` also matches immediately *before* a trailing newline,
+  so `^0x[0-9a-f]+$` accepts `"0x1\n"` and `int()` would happily turn that into
+  `1`. A field must match end to end or it is rejected.
+* **Bounded before decoded.** A known event accepts at most 4 topics (3 for
+  `ApprovalForAll`), `data` at most 66 raw characters (`0x` + 32 bytes), and a
+  quantity at most 64 hex digits. The bounds are applied to the raw strings
+  before any list walk or `bytes.fromhex`, so an oversized payload is refused
+  instead of being allocated first.
+
 | Field | Rule |
 | --- | --- |
 | `address` | 42 chars, `0x` + 40 hex → valid 20-byte address |
 | `topics[i]` | 66 chars, `0x` + 64 hex → valid 32-byte word |
+| `topics` (Transfer / Approval) | at most 4 entries |
+| `topics` (ApprovalForAll) | at most 3 entries |
 | indexed address | first 12 bytes of the topic must be zero |
-| `data` | `0x`-prefixed, even number of hex digits |
-| `blockNumber`, `transactionIndex`, `logIndex` | canonical JSON-RPC quantity: `0x`-prefixed, no leading zeroes |
+| `data` | `0x`-prefixed, even number of hex digits, at most 66 chars |
+| `blockNumber`, `transactionIndex`, `logIndex` | canonical JSON-RPC quantity: `0x`-prefixed, at most 64 hex digits, no leading zeroes |
 | `blockHash`, `transactionHash` | 32-byte hex |
 | `removed` | must be a JSON boolean; `true` is rejected outright |
 | ABI `bool` | exactly `0` or `1`; anything else is invalid encoding |
 | ERC-20 `data` | exactly 32 bytes |
 | ERC-721 `data` | exactly empty |
+
+The `0x` prefix is matched case-sensitively: `0X` is a different string and is
+rejected. The hex digits themselves may be upper or lower case, because EIP-55
+addresses are mixed-case by design — they are lowercased on input and the output
+is always lowercase.
 
 Violations of a **known** event raise `LogDecodeError`. Unknown `topic0` returns
 `None` — an unrecognised event is out of scope, not an error.
@@ -207,7 +226,7 @@ This is a decoder, not an event monitoring system.
 
 ## Testing
 
-`tests/test_event_decoder.py` — 102 tests, fully offline, no socket opened.
+`tests/test_event_decoder.py` — 134 tests, fully offline, no socket opened.
 
 Coverage includes all five valid layouts, mint/burn via the zero address,
 `uint256` maximum values, lowercase normalisation, and the rejection paths:
@@ -217,7 +236,16 @@ address/hash/quantity, `removed: true`, missing fields, and layout mismatches fo
 known events. Batch behaviour is covered for ordering, unknown-event skipping,
 and error propagation.
 
+Two further groups pin the input-validation boundary: a trailing newline or any
+surrounding whitespace on an address, hash, topic, quantity or `data` field is
+rejected even when the string's length still looks correct, `0X` prefixes are
+rejected, and oversized inputs (an absurd topic list, a kilobyte of `data`, a
+65-digit quantity) are refused before conversion while all five legitimate
+layouts still decode.
+
 The rejection paths were verified by mutation: disabling each check in turn
 (`removed`, `bool` range, address padding, quantity leading zeroes, the 3-vs-4
 topic discriminator) makes the corresponding tests fail, which confirms the
-tests constrain behaviour rather than merely observing it.
+tests constrain behaviour rather than merely observing it. The same holds for
+this round: reverting `fullmatch` to `match` + `$` and dropping the size bounds
+fails 12 tests, so the fixes are pinned rather than assumed.

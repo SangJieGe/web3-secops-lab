@@ -27,7 +27,7 @@ is emitted identically by ERC-721 and ERC-1155, so it is labelled
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
 
@@ -71,8 +71,28 @@ ZERO_ADDRESS: Final[str] = "0x0000000000000000000000000000000000000000"
 
 _MAX_UINT256: Final[int] = (1 << 256) - 1
 
-_LOWER_HEX_RE = re.compile(r"^0x[0-9a-f]*$")
-_CANONICAL_HEX_RE = re.compile(r"^0x[0-9a-f]+$")
+# Hex string shapes are validated with ``fullmatch``, never ``match`` + ``$``.
+#
+# ``re``'s ``$`` also matches immediately *before* a trailing newline, so
+# ``re.match(r"^0x[0-9a-f]+$", "0x1\n")`` succeeds and ``int()``/``bytes.fromhex``
+# would then quietly accept a field a node never sent. ``fullmatch`` anchors at
+# the real end of the string, so ``"0x1\n"`` fails as it must.
+#
+# Only the literal ``0x`` prefix is lowercase — that is the JSON-RPC spelling, and
+# ``0X`` is rejected as a different string. The hex digits themselves accept either
+# case, because EIP-55 addresses are mixed-case by design; callers lowercase the
+# digits before matching, but never the prefix.
+_HEX_DIGITS_RE = re.compile(r"[0-9a-f]+")
+_HEX_DIGITS_OPTIONAL_RE = re.compile(r"[0-9a-f]*")
+
+#: JSON-RPC QUANTITY: no leading zeroes unless the value is zero itself.
+_CANONICAL_QUANTITY_RE = re.compile(r"0x(?:0|[1-9a-f][0-9a-f]*)")
+
+#: Upper bounds applied *before* any conversion or allocation.
+MAX_TOPICS_TRANSFER_APPROVAL: Final[int] = 4
+MAX_TOPICS_APPROVAL_FOR_ALL: Final[int] = 3
+MAX_DATA_HEX_CHARS: Final[int] = 66  # "0x" + 32 bytes
+MAX_QUANTITY_HEX_DIGITS: Final[int] = 64
 
 
 class LogDecodeError(ValueError):
@@ -107,13 +127,16 @@ def _require_address(value: Any, field_name: str) -> str:
 
     Checksum casing is accepted on input and normalised away, since the EIP-55
     checksum cannot be verified without keccak256 and doing so is not this
-    layer's job. Shape and length are enforced strictly.
+    layer's job. Shape and length are enforced strictly, and ``fullmatch`` means
+    a trailing newline cannot ride along inside a 42-character string.
     """
     if not isinstance(value, str):
         raise _fail(field_name, "must be a string")
     if len(value) != 42:
         raise _fail(field_name, f"must be 42 chars (0x + 40 hex), got {len(value)}")
-    if not _LOWER_HEX_RE.match(value.lower()):
+    if not value.startswith("0x"):
+        raise _fail(field_name, "must be 0x-prefixed")
+    if not _HEX_DIGITS_RE.fullmatch(value[2:].lower()):
         raise _fail(field_name, "must be hex-encoded")
     return value.lower()
 
@@ -124,7 +147,9 @@ def _require_hash32(value: Any, field_name: str) -> str:
         raise _fail(field_name, "must be a string")
     if len(value) != 66:
         raise _fail(field_name, f"must be 66 chars (0x + 64 hex), got {len(value)}")
-    if not _LOWER_HEX_RE.match(value.lower()):
+    if not value.startswith("0x"):
+        raise _fail(field_name, "must be 0x-prefixed")
+    if not _HEX_DIGITS_RE.fullmatch(value[2:].lower()):
         raise _fail(field_name, "must be hex-encoded")
     return value.lower()
 
@@ -133,8 +158,9 @@ def _require_quantity(raw: Mapping[str, Any], field_name: str) -> int:
     """Decode a JSON-RPC QUANTITY (``0x``-prefixed hex integer).
 
     JSON-RPC quantity encoding forbids leading zeroes except for the value zero
-    itself, and rejects ``0x`` with no digits. Honouring that makes a malformed
-    quantity fail loudly instead of silently becoming a plausible number.
+    itself, and rejects ``0x`` with no digits. The whole string must match, so a
+    trailing newline, trailing space or any other stray character is a rejection,
+    not something ``int()`` gets to ignore.
     """
     value = raw.get(field_name)
     if not isinstance(value, str):
@@ -142,25 +168,36 @@ def _require_quantity(raw: Mapping[str, Any], field_name: str) -> int:
     if not value.startswith("0x"):
         raise _fail(field_name, "must be 0x-prefixed")
     digits = value[2:]
+    # Bound the width before doing anything with the digits.
+    if len(digits) > MAX_QUANTITY_HEX_DIGITS:
+        raise _fail(
+            field_name,
+            f"exceeds {MAX_QUANTITY_HEX_DIGITS} hex digits, got {len(digits)}",
+        )
     if not digits:
         raise _fail(field_name, "must contain at least one hex digit")
-    if not _LOWER_HEX_RE.match("0x" + digits.lower()):
-        raise _fail(field_name, "must be hex-encoded")
-    if len(digits) > 1 and digits.startswith("0"):
-        raise _fail(field_name, "must not have leading zeroes")
+    if not _CANONICAL_QUANTITY_RE.fullmatch("0x" + digits.lower()):
+        # Covers non-hex characters, leading zeroes, and stray whitespace alike.
+        raise _fail(field_name, "must be a canonical hex quantity without leading zeroes")
     return int(digits, 16)
 
 
-def _require_hex_data(value: Any, field_name: str) -> bytes:
-    """Validate ``0x``-prefixed, even-length hex data and return its bytes."""
+def _require_hex_data(value: Any, field_name: str, *, max_hex_chars: int | None = None) -> bytes:
+    """Validate ``0x``-prefixed, even-length hex data and return its bytes.
+
+    ``max_hex_chars`` bounds the *raw string* length before any conversion, so an
+    oversized payload is rejected without first decoding it into memory.
+    """
     if not isinstance(value, str):
         raise _fail(field_name, "must be a string")
     if not value.startswith("0x"):
         raise _fail(field_name, "must be 0x-prefixed")
+    if max_hex_chars is not None and len(value) > max_hex_chars:
+        raise _fail(field_name, f"exceeds {max_hex_chars} chars, got {len(value)}")
     digits = value[2:]
     if len(digits) % 2 != 0:
         raise _fail(field_name, f"must have an even number of hex digits, got {len(digits)}")
-    if not _LOWER_HEX_RE.match("0x" + digits.lower()):
+    if not _HEX_DIGITS_OPTIONAL_RE.fullmatch(digits.lower()):
         raise _fail(field_name, "must be hex-encoded")
     return bytes.fromhex(digits)
 
@@ -288,20 +325,38 @@ class _LogEnvelope:
     log_index: int
 
 
-def _parse_envelope(raw: Mapping[str, Any]) -> _LogEnvelope:
+def _bound_topics(raw: Mapping[str, Any], max_topics: int) -> list[Any]:
+    """Reject an oversized ``topics`` list *before* validating its members.
+
+    Validation of each topic allocates a lowercased copy, so a node returning
+    10,000 topics would cost 10,000 validations before the event layout check
+    ever ran. Bounding the list first keeps the cost of a hostile log constant.
+    """
+    topics_raw = raw.get("topics")
+    if not isinstance(topics_raw, (list, tuple)):
+        raise _fail("topics", "must be a list")
+    if len(topics_raw) > max_topics:
+        raise _fail("topics", f"expected at most {max_topics} entries, got {len(topics_raw)}")
+    return list(topics_raw)
+
+
+def _parse_envelope(raw: Mapping[str, Any], *, max_topics: int) -> _LogEnvelope:
     """Validate every non-topic field of the raw log.
 
     Field order in the error messages follows the order an operator would check
     them, so the first failure reported is the most structurally fundamental one.
+
+    ``max_topics`` is the bound for the event being decoded: 4 for
+    Transfer/Approval, 3 for ApprovalForAll. The bound is enforced before member
+    validation, and ``data`` is bounded by raw character count before decoding.
     """
     address = _require_address(raw.get("address"), "address")
 
-    topics_raw = raw.get("topics")
-    if not isinstance(topics_raw, (list, tuple)):
-        raise _fail("topics", "must be a list")
-    topics = tuple(_require_hash32(t, f"topics[{i}]") for i, t in enumerate(topics_raw))
+    topics = tuple(
+        _require_hash32(t, f"topics[{i}]") for i, t in enumerate(_bound_topics(raw, max_topics))
+    )
 
-    data = _require_hex_data(raw.get("data"), "data")
+    data = _require_hex_data(raw.get("data"), "data", max_hex_chars=MAX_DATA_HEX_CHARS)
 
     block_number = _require_quantity(raw, "blockNumber")
     block_hash = _require_hash32(raw.get("blockHash"), "blockHash")
@@ -473,10 +528,26 @@ def _build(
     )
 
 
-_DECODERS = {
-    TRANSFER_TOPIC0: _decode_transfer,
-    APPROVAL_TOPIC0: _decode_approval,
-    APPROVAL_FOR_ALL_TOPIC0: _decode_approval_for_all,
+@dataclass(frozen=True, slots=True)
+class _EventSpec:
+    """What a known ``topic0`` implies about a log's shape.
+
+    ``max_topics`` is bound *before* members are validated, so a hostile log with
+    an enormous topic list costs a length check rather than thousands of
+    validations. ``decode`` performs the layout-specific decoding.
+    """
+
+    name: str
+    max_topics: int
+    decode: Callable[[_LogEnvelope, int], DecodedEvent]
+
+
+_EVENT_SPECS: Final[dict[str, _EventSpec]] = {
+    TRANSFER_TOPIC0: _EventSpec("Transfer", MAX_TOPICS_TRANSFER_APPROVAL, _decode_transfer),
+    APPROVAL_TOPIC0: _EventSpec("Approval", MAX_TOPICS_TRANSFER_APPROVAL, _decode_approval),
+    APPROVAL_FOR_ALL_TOPIC0: _EventSpec(
+        "ApprovalForAll", MAX_TOPICS_APPROVAL_FOR_ALL, _decode_approval_for_all
+    ),
 }
 
 
@@ -516,14 +587,19 @@ def decode_log(raw: Any, chain_id: int) -> DecodedEvent | None:
         return None
 
     topic0 = _require_hash32(topics[0], "topics[0]")
-    decoder = _DECODERS.get(topic0)
-    if decoder is None:
+    known = _EVENT_SPECS.get(topic0)
+    if known is None:
         return None
 
+    # The bound depends on the event, so it is applied only now that topic0 has
+    # told us which event this claims to be. An unknown topic0 with a huge topic
+    # list therefore still returns None, as agreed — it is out of scope, not
+    # malformed.
+    #
     # Validate the envelope only for logs this decoder actually handles, so an
     # unsupported event does not fail on metadata it will never be used for.
-    env = _parse_envelope(log)
-    return decoder(env, cid)
+    env = _parse_envelope(log, max_topics=known.max_topics)
+    return known.decode(env, cid)
 
 
 def decode_logs(raw_logs: Iterable[Any], chain_id: int) -> list[DecodedEvent]:

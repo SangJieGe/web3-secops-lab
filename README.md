@@ -145,7 +145,7 @@ relevant ones add `chain_id`, `block_number`, `duration_ms`.
 ## Tests
 
 ```bash
-pytest -q          # 221 tests, fully offline
+pytest -q          # 253 tests, fully offline
 ruff check .       # lint
 ruff format --check .
 ```
@@ -157,9 +157,9 @@ The suite is **offline by design** and this is enforced, not just claimed:
   HTTP client, but the endpoint is a loopback JSON-RPC stub
   (`tests/local_rpc_server.py`) bound to `127.0.0.1` — never a public RPC host.
 * Verified by running the whole suite inside `unshare -rn` (a network namespace
-  with no route off the host): **221 passed** with only loopback up.
+  with no route off the host): **253 passed** with only loopback up.
 
-M1 contributes 119 tests; M2-A adds 102 decoder tests, which open no socket at
+M1 contributes 119 tests; M2-A adds 134 decoder tests, which open no socket at
 all — they build logs from literal hex in-process.
 
 `pytest` contacts no public endpoint and requires no RPC API key, in CI or
@@ -197,7 +197,7 @@ tests/
   test_block_scanner.py
   test_main.py
   test_entrypoint.py # real subprocess, loopback endpoint, no public network
-  test_event_decoder.py  # M2-A: 102 offline decode/validation tests
+  test_event_decoder.py  # M2-A: 134 offline decode/validation tests
 docs/
   architecture.md
   threat-model.md
